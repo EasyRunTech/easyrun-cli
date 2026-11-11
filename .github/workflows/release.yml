@@ -1,0 +1,70 @@
+name: release
+
+# Mendorong tag `v*` membangun program untuk tiap sistem lalu menerbitkannya,
+# masing-masing dengan `.sha256` di sebelahnya, sebagai rilis GitHub.
+# install.sh dan `easyrun --self-update` mengunduh dari
+# `releases/latest/download/<aset>`, jadi nama aset di bawah adalah KONTRAK —
+# ganti di install.sh juga.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, name: easyrun-linux-x86_64,   ext: "" }
+          - { goos: linux,   goarch: arm64, name: easyrun-linux-arm64,    ext: "" }
+          - { goos: darwin,  goarch: arm64, name: easyrun-macos-arm64,    ext: "" }
+          - { goos: darwin,  goarch: amd64, name: easyrun-macos-x86_64,   ext: "" }
+          - { goos: windows, goarch: amd64, name: easyrun-windows-x86_64, ext: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Uji
+        run: go test ./...
+
+      # CGO_ENABLED=0: program statis, jalan di distro Linux mana pun tanpa
+      # bergantung pada glibc runner.
+      - name: Bangun
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          out="${{ matrix.name }}${{ matrix.ext }}"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/EasyRunTech/easyrun-cli/internal/version.Version=${GITHUB_REF_NAME}" \
+            -o "$out" ./cmd/easyrun
+          sha256sum "$out" > "$out.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}${{ matrix.ext }}
+            ${{ matrix.name }}${{ matrix.ext }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
