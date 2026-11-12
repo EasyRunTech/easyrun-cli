@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/EasyRunTech/easyrun-cli/internal/config"
@@ -44,6 +45,10 @@ type IncludeResult struct {
 	// Stale — nomor baris (1-based, sebelum disisipi) baris Include easyrun
 	// lain yang tidak berada di bagian atas; dibiarkan apa adanya.
 	Stale []int
+	// Shadowing — berkas yang di-Include DI ATAS baris kita dan menyetel
+	// opsi yang bentrok untuk semua host (`Host *`, `Match all`, atau di luar
+	// blok); karena itu baris kita disisipkan ulang di baris 1.
+	Shadowing []string
 }
 
 // isOurInclude — baris `Include` (tanpa beda huruf besar/kecil, boleh
@@ -81,28 +86,151 @@ func directive(line string) (kw, rest string, ok bool) {
 // includeAtTop — baris Include kita sudah ada sebelum direktif apa pun
 // selain Include lain (komentar dan baris kosong diabaikan). Include lain di
 // atasnya dibiarkan: alat seperti OrbStack/Colima menyisipkan baris Include
-// mereka di puncak, dan itu tidak boleh membuat baris kita digandakan.
-// Mengembalikan juga nomor baris kemunculan lain yang tidak di atas.
-func includeAtTop(lines []string) (atTop bool, stale []int) {
+// mereka di puncak, dan itu tidak boleh membuat baris kita digandakan —
+// KECUALI berkas yang mereka muat menyetel opsi bentrok untuk semua host
+// (shadowing ≠ nil): ssh memakai nilai pertama, jadi `Host *` di sana menang
+// atas blok box. Mengembalikan juga nomor baris kemunculan lain yang tidak
+// di atas, dan berkas yang membayangi.
+func includeAtTop(lines []string, shadowing func(includeArgs string) []string) (atTop bool, stale []int, shadow []string) {
 	top := true // belum bertemu direktif selain Include
+	checked := false
+	var above []string
 	for i, l := range lines {
-		kw, _, ok := directive(l)
+		kw, rest, ok := directive(l)
 		if !ok {
 			continue
 		}
 		if isOurInclude(l) {
-			if top && !atTop {
-				atTop = true
-			} else {
-				stale = append(stale, i+1)
+			if top && !atTop && !checked {
+				checked = true
+				if shadowing != nil {
+					for _, a := range above {
+						shadow = append(shadow, shadowing(a)...)
+					}
+				}
+				if len(shadow) == 0 {
+					atTop = true
+					continue
+				}
 			}
+			stale = append(stale, i+1)
 			continue
 		}
 		if kw != "include" {
 			top = false
+		} else if top && !atTop {
+			above = append(above, rest)
 		}
 	}
-	return atTop, stale
+	return atTop, stale, shadow
+}
+
+// conflictingOptions — opsi (huruf kecil) yang, bila disetel untuk semua host
+// SEBELUM blok box dibaca, mengalahkan atau merusak blok itu: ssh memakai
+// nilai pertama. Opsi yang menumpuk (IdentityFile, CertificateFile,
+// LocalForward) atau tidak berbahaya (AddKeysToAgent, UseKeychain) tidak
+// termasuk.
+var conflictingOptions = map[string]bool{
+	"user": true, "hostname": true, "port": true, "proxyjump": true, "proxycommand": true,
+	"identitiesonly": true, "hostkeyalias": true, "userknownhostsfile": true,
+	"stricthostkeychecking": true, "forwardagent": true, "forwardx11": true,
+	"forwardx11trusted": true, "remotecommand": true, "requesttty": true,
+}
+
+const (
+	// maxIncludeDepth — Include bersarang yang ditelusuri (OpenSSH: 16).
+	maxIncludeDepth = 8
+	// maxIncludedFile — berkas lebih besar dari ini tidak dibaca.
+	maxIncludedFile = 1 << 20
+)
+
+// ShadowingFiles — berkas dari argumen satu baris Include (pola glob seperti
+// yang dipahami ssh: "~/" = home, path relatif = relatif ke sshDir) yang
+// menyetel opsi bentrok untuk semua host. Berkas yang tidak terbaca
+// dilewati: ssh sendiri juga mengabaikannya.
+func ShadowingFiles(includeArgs, sshDir, home string) []string {
+	return shadowingFiles(includeArgs, sshDir, home, 0, map[string]bool{})
+}
+
+func shadowingFiles(includeArgs, sshDir, home string, depth int, seen map[string]bool) []string {
+	if depth > maxIncludeDepth {
+		return nil
+	}
+	var out []string
+	for _, f := range strings.Fields(includeArgs) {
+		f = strings.Trim(f, `"`)
+		switch {
+		case f == "~":
+			f = home
+		case strings.HasPrefix(f, "~/"):
+			f = filepath.Join(home, f[2:])
+		case !filepath.IsAbs(f):
+			f = filepath.Join(sshDir, f)
+		}
+		matches, err := filepath.Glob(f)
+		if err != nil || len(matches) == 0 {
+			matches = []string{f}
+		}
+		for _, m := range matches {
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			fi, err := os.Stat(m)
+			if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxIncludedFile {
+				continue
+			}
+			data, err := os.ReadFile(m)
+			if err != nil {
+				continue
+			}
+			if setsGlobalConflict(data) {
+				out = append(out, m)
+			}
+			for _, l := range strings.Split(string(data), "\n") {
+				if kw, rest, ok := directive(l); ok && kw == "include" {
+					out = append(out, shadowingFiles(rest, sshDir, home, depth+1, seen)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// setsGlobalConflict — isi berkas config menyetel opsi bentrok di luar blok
+// (berlaku untuk semua host), di dalam `Host` dengan pola "*", atau di dalam
+// `Match` yang memuat kriteria "all" atau `host *`.
+func setsGlobalConflict(data []byte) bool {
+	global := true // sebelum Host/Match pertama
+	for _, l := range strings.Split(string(data), "\n") {
+		kw, rest, ok := directive(l)
+		if !ok {
+			continue
+		}
+		switch kw {
+		case "host":
+			global = false
+			for _, pat := range strings.Fields(rest) {
+				if strings.Trim(pat, `"`) == "*" {
+					global = true
+				}
+			}
+		case "match":
+			f := strings.Fields(strings.ToLower(rest))
+			global = slices.Contains(f, "all")
+			for i := 0; i+1 < len(f); i++ {
+				if f[i] == "host" && strings.Trim(f[i+1], `"`) == "*" {
+					global = true
+				}
+			}
+		case "include":
+		default:
+			if global && conflictingOptions[kw] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // EnsureInclude — pastikan ~/.ssh/config (configPath) memuat IncludeLine di
@@ -111,8 +239,9 @@ func includeAtTop(lines []string) (atTop bool, stale []int) {
 // belum ada dibuat 0600; izin berkas yang sudah ada dipertahankan; symlink
 // (dotfiles) diikuti sehingga berkas tujuannya yang diubah. Sebelum
 // perubahan pertama, isi lama disalin SEKALI ke configPath+BackupSuffix.
-// Idempoten.
-func EnsureInclude(configPath string) (IncludeResult, error) {
+// Idempoten. home dipakai untuk mengembangkan "~/" pada baris Include lain
+// yang diperiksa (ShadowingFiles).
+func EnsureInclude(configPath, home string) (IncludeResult, error) {
 	var res IncludeResult
 	target := configPath
 	if fi, err := os.Lstat(configPath); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
@@ -134,7 +263,7 @@ func EnsureInclude(configPath string) (IncludeResult, error) {
 		if err := config.WriteFileExclusive(target, []byte(IncludeLine+"\n"), filePerm); err != nil {
 			if errors.Is(err, fs.ErrExist) {
 				// Dibuat proses lain di sela-sela: ulangi dengan isi barunya.
-				return EnsureInclude(configPath)
+				return EnsureInclude(configPath, home)
 			}
 			return res, err
 		}
@@ -154,8 +283,11 @@ func EnsureInclude(configPath string) (IncludeResult, error) {
 		body = body[len(utf8BOM):]
 	}
 	lines := strings.Split(string(body), "\n")
-	atTop, stale := includeAtTop(lines)
-	res.Stale = stale
+	sshDir := filepath.Dir(configPath)
+	atTop, stale, shadow := includeAtTop(lines, func(args string) []string {
+		return ShadowingFiles(args, sshDir, home)
+	})
+	res.Stale, res.Shadowing = stale, shadow
 	if atTop {
 		return res, nil
 	}
@@ -209,4 +341,73 @@ func WriteBoxConf(sshDir, id, block string) (path string, existed bool, err erro
 		existed = true
 	}
 	return path, existed, config.WriteFileAtomic(path, []byte(block), filePerm)
+}
+
+// confMarker — penanda berkas blok yang ditulis easyrun (baris komentar
+// pertama WriteBoxConf / ConfigBlock).
+const confMarker = "`easyrun ssh-config"
+
+// StaleConfs — hasil RemoveStaleConfs.
+type StaleConfs struct {
+	// Removed — berkas buatan easyrun untuk alias yang sama (box lain, mis.
+	// box lama yang sudah dihapus) yang dihapus.
+	Removed []string
+	// Foreign — berkas di folder yang sama yang juga memuat `Host <alias>`
+	// tetapi tidak dibuat easyrun; dibiarkan, hanya dilaporkan.
+	Foreign []string
+}
+
+// RemoveStaleConfs — hapus ~/.ssh/easyrun/*.conf SELAIN milik keepID yang
+// memuat `Host <alias>`: ssh memuatnya berurutan menurut nama berkas, jadi
+// blok box lama dengan alias yang sama bisa menang atas blok yang baru
+// ditulis. Hanya berkas berpenanda easyrun yang dihapus.
+func RemoveStaleConfs(sshDir, keepID, alias string) (StaleConfs, error) {
+	var res StaleConfs
+	dir := filepath.Join(sshDir, IncludeDirName)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return res, nil
+	}
+	if err != nil {
+		return res, err
+	}
+	keep := keepID + ".conf"
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasSuffix(name, ".conf") || strings.EqualFold(name, keep) {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
+		if err != nil || !declaresHost(data, alias) {
+			continue
+		}
+		if !bytes.Contains(data, []byte(confMarker)) {
+			res.Foreign = append(res.Foreign, path)
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+			continue
+		}
+		res.Removed = append(res.Removed, path)
+	}
+	return res, errors.Join(errs...)
+}
+
+// declaresHost — ada baris `Host` yang salah satu polanya persis alias.
+func declaresHost(data []byte, alias string) bool {
+	for _, l := range strings.Split(string(data), "\n") {
+		kw, rest, ok := directive(l)
+		if !ok || kw != "host" {
+			continue
+		}
+		for _, pat := range strings.Fields(rest) {
+			if strings.EqualFold(strings.Trim(pat, `"`), alias) {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -72,13 +72,20 @@ func TestLocate(t *testing.T) {
 			return "rel/dir"
 		}
 		return ""
-	})
+	}, nil)
 	if err != nil || !filepath.IsAbs(p) || !strings.HasSuffix(p, filepath.Join("rel", "dir")) {
 		t.Fatalf("EASYRUN_CONFIG_DIR: %q %v", p, err)
 	}
-	p, err = Locate(func(string) string { return "" })
+	p, err = Locate(func(string) string { return "" }, nil)
 	if err != nil || filepath.Base(p) != ".easyrun" {
 		t.Fatalf("bawaan ~/.easyrun: %q %v", p, err)
+	}
+	// Temuan review 15: home lewat dependensi yang diberikan, bukan
+	// os.UserHomeDir langsung.
+	home := t.TempDir()
+	p, err = Locate(func(string) string { return "" }, func() (string, error) { return home, nil })
+	if err != nil || p != filepath.Join(home, ".easyrun") {
+		t.Fatalf("home dari dependensi: %q %v", p, err)
 	}
 }
 
@@ -223,5 +230,67 @@ func TestConfigDanSertifikat(t *testing.T) {
 	}
 	if got := d.CertPath("abc"); filepath.Base(got) != "abc-cert.pub" {
 		t.Fatalf("CertPath: %s", got)
+	}
+}
+
+// Temuan review 7: path folder berisi karakter pola glob ("[") tetap
+// membuat sertifikat lama terhapus.
+func TestRemoveCertificatesPathBerkurung(t *testing.T) {
+	d := Dir{Path: filepath.Join(t.TempDir(), "[kerja]", ".easyrun")}
+	if err := d.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"a-cert.pub", "b-cert.pub", "id_ed25519"} {
+		if err := os.WriteFile(filepath.Join(d.SSHDir(), n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.RemoveCertificates(); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := os.ReadDir(d.SSHDir())
+	if len(entries) != 1 || entries[0].Name() != "id_ed25519" {
+		t.Fatalf("sisa: %v", entries)
+	}
+	// Folder ssh belum ada = tidak ada yang perlu dihapus.
+	if err := (Dir{Path: filepath.Join(t.TempDir(), "kosong")}).RemoveCertificates(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Temuan review 14: pembaca menunggu berkas yang masih setengah tertulis.
+func TestReadFileSettled(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "kunci")
+	_ = os.WriteFile(p, []byte("seteng"), 0o600)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		_ = os.WriteFile(p, []byte("lengkap"), 0o600)
+	}()
+	b, err := ReadFileSettled(p, func(b []byte) error {
+		if string(b) != "lengkap" {
+			return errors.New("belum lengkap")
+		}
+		return nil
+	})
+	if err != nil || string(b) != "lengkap" {
+		t.Fatalf("%q %v", b, err)
+	}
+}
+
+// Temuan review 6: selisih jam tersimpan; berkas rusak/tidak ada = nol.
+func TestClockOffset(t *testing.T) {
+	d := Dir{Path: filepath.Join(t.TempDir(), "cfg")}
+	if c := d.LoadClockOffset(); c.Offset() != 0 {
+		t.Fatalf("awal %v", c)
+	}
+	if err := d.SaveClockOffset(ClockOffset{OffsetSeconds: -3660}); err != nil {
+		t.Fatal(err)
+	}
+	if c := d.LoadClockOffset(); c.Offset() != -61*time.Minute {
+		t.Fatalf("%v", c)
+	}
+	_ = os.WriteFile(d.ClockPath(), []byte("{rusak"), 0o600)
+	if c := d.LoadClockOffset(); c.Offset() != 0 {
+		t.Fatalf("rusak %v", c)
 	}
 }

@@ -29,8 +29,12 @@ func (a *App) selfUpdate() int {
 		url = v
 	}
 	cmd := exec.Command("bash", "-c", `curl -fsSL "$1" | bash`, "easyrun-installer", url)
-	cmd.Env = append(os.Environ(), "EASYRUN_INSTALL_DIR="+filepath.Dir(exe))
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = a.Stdout, a.Stderr, os.Stdin
+	env := os.Environ()
+	if a.Environ != nil {
+		env = a.Environ()
+	}
+	cmd.Env = append(env, "EASYRUN_INSTALL_DIR="+filepath.Dir(exe))
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = a.Stdout, a.Stderr, a.Stdin
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintln(a.Stderr, "easyrun: pembaruan gagal:", err)
 		return 1

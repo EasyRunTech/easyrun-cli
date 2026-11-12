@@ -97,7 +97,7 @@ func TestArgvPersis(t *testing.T) {
 		"-o", "CertificateFile=/home/budi/.easyrun/ssh/" + testID + "-cert.pub",
 		"-o", "IdentitiesOnly=yes",
 		"-o", "ProxyCommand=/usr/local/bin/easyrun tunnel " + testID,
-		"-o", "HostKeyAlias=uji-box.easyrun.io",
+		"-o", "HostKeyAlias=" + testID,
 		"-o", "UserKnownHostsFile=/home/budi/.easyrun/known_hosts",
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "ServerAliveInterval=30",
@@ -162,7 +162,7 @@ func fakeExe(t *testing.T, dirName string) (exe, argsFile string) {
 // perintah sisipan yang jalan.
 func TestProxyCommandAmanDiShell(t *testing.T) {
 	exe, argsFile := fakeExe(t, "dir $(touch PWNED); x & y|z")
-	cmd, err := ProxyCommand(exe, testID, runtime.GOOS)
+	cmd, err := ProxyCommand(Invocation{Exe: exe, GOOS: runtime.GOOS}, testID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestArgvDibacaOpenSSH(t *testing.T) {
 	want := map[string]string{
 		"user":                  "ubuntu",
 		"hostname":              "uji-box.easyrun.io",
-		"hostkeyalias":          "uji-box.easyrun.io",
+		"hostkeyalias":          testID,
 		"identitiesonly":        "yes",
 		"stricthostkeychecking": "accept-new",
 		"serveraliveinterval":   "30",
@@ -271,7 +271,7 @@ func TestConfigBlockDibacaOpenSSH(t *testing.T) {
 	want := map[string]string{
 		"hostname":              "uji-box.easyrun.io",
 		"user":                  "ubuntu",
-		"hostkeyalias":          "uji-box.easyrun.io",
+		"hostkeyalias":          testID,
 		"identitiesonly":        "yes",
 		"stricthostkeychecking": "accept-new",
 		"serveraliveinterval":   "30",
@@ -318,5 +318,59 @@ func TestConfigBlockWindowsPath(t *testing.T) {
 		if !strings.Contains(block, want) {
 			t.Errorf("blok tak memuat %q:\n%s", want, block)
 		}
+	}
+}
+
+// Temuan review 1: ProxyCommand/Match exec membawa folder konfigurasi dan
+// alamat API, dikutip dengan aturan yang sama dengan path program.
+func TestInvocationMembawaFolderDanAlamatAPI(t *testing.T) {
+	cases := []struct {
+		v    Invocation
+		sub  string
+		want string
+	}{
+		{Invocation{Exe: "/usr/local/bin/easyrun", ConfigDir: "/Users/budi lain/.easyrun", APIURL: "https://api.contoh.test", GOOS: "darwin"},
+			"tunnel", "/usr/local/bin/easyrun --config-dir '/Users/budi lain/.easyrun' --api-url https://api.contoh.test tunnel " + testID},
+		{Invocation{Exe: "/usr/local/bin/easyrun", ConfigDir: "/data/100%/.easyrun", GOOS: "linux"},
+			"ssh-prepare", "/usr/local/bin/easyrun --config-dir '/data/100%%/.easyrun' ssh-prepare " + testID},
+		{Invocation{Exe: `C:\Program Files\EasyRun\easyrun.exe`, ConfigDir: `C:\Users\budi\.easyrun`, GOOS: "windows"},
+			"tunnel", `"C:\Program Files\EasyRun\easyrun.exe" --config-dir C:\Users\budi\.easyrun tunnel ` + testID},
+		{Invocation{Exe: "/usr/local/bin/easyrun", GOOS: "linux"},
+			"tunnel", "/usr/local/bin/easyrun tunnel " + testID},
+	}
+	for _, c := range cases {
+		f := ProxyCommand
+		if c.sub == "ssh-prepare" {
+			f = PrepareCommand
+		}
+		got, err := f(c.v, testID)
+		if err != nil || got != c.want {
+			t.Errorf("%+v:\n got %q %v\nwant %q", c.v, got, err, c.want)
+		}
+	}
+	if _, err := ProxyCommand(Invocation{Exe: "/usr/local/bin/easyrun", ConfigDir: "/tmp/a'b", GOOS: "linux"}, testID); err == nil {
+		t.Fatal("folder berisi ' harus ditolak")
+	}
+}
+
+// Folder berisi spasi dan karakter shell sampai utuh sebagai satu argumen.
+func TestInvocationAmanDiShell(t *testing.T) {
+	exe, argsFile := fakeExe(t, "bin")
+	dir := filepath.Join(t.TempDir(), "folder $(touch PWNED) & x")
+	cmd, err := PrepareCommand(Invocation{Exe: exe, ConfigDir: dir, APIURL: "https://api.contoh.test", GOOS: runtime.GOOS}, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := exec.Command("/bin/sh", "-c", "exec "+cmd)
+	c.Dir = t.TempDir()
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	want := "--config-dir\n" + dir + "\n--api-url\nhttps://api.contoh.test\nssh-prepare\n" + testID + "\n"
+	if got, _ := os.ReadFile(argsFile); string(got) != want {
+		t.Fatalf("argumen %q, ingin %q", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(c.Dir, "PWNED")); err == nil {
+		t.Fatal("perintah sisipan jalan")
 	}
 }

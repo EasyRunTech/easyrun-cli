@@ -81,8 +81,23 @@ func generate(privPath, comment string) ([]byte, error) {
 	case err == nil:
 		return data, nil
 	case errors.Is(err, fs.ErrExist):
-		// Proses lain baru saja membuatnya: pakai milik proses itu.
-		return os.ReadFile(privPath)
+		// Proses lain baru saja membuatnya: pakai milik proses itu. Di
+		// sistem berkas tanpa hard link berkas itu bisa masih setengah
+		// tertulis — tunggu sampai bisa diurai.
+		b, err := config.ReadFileSettled(privPath, func(b []byte) error {
+			_, err := ssh.ParsePrivateKey(b)
+			var missing *ssh.PassphraseMissingError
+			if errors.As(err, &missing) {
+				return nil // utuh; EnsureKey yang menolaknya dengan pesan jelas
+			}
+			return err
+		})
+		if err != nil {
+			// Tetap tidak terurai: berkas memang rusak, bukan sedang ditulis.
+			// Isinya dikembalikan supaya EnsureKey memberi pesan yang jelas.
+			return os.ReadFile(privPath)
+		}
+		return b, nil
 	default:
 		return nil, err
 	}
@@ -125,7 +140,10 @@ func Check(cert *ssh.Certificate, w Want) error {
 	if cert.CertType != ssh.UserCert {
 		return errors.New("bukan sertifikat pengguna")
 	}
-	if !slices.Contains(cert.ValidPrincipals, w.Principal) {
+	// Id box = UUID: huruf besar/kecil tidak membedakan box (panel selalu
+	// menulis huruf kecil, tetapi CLI tidak boleh menolak sertifikat yang
+	// sah hanya karena itu lalu meminta sertifikat baru setiap sambungan).
+	if !slices.ContainsFunc(cert.ValidPrincipals, func(p string) bool { return strings.EqualFold(p, w.Principal) }) {
 		return fmt.Errorf("sertifikat untuk box lain (principal %q, ingin %q)", strings.Join(cert.ValidPrincipals, ","), w.Principal)
 	}
 	if w.Key != nil && !bytes.Equal(cert.Key.Marshal(), w.Key.Marshal()) {

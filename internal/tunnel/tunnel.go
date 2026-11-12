@@ -151,6 +151,10 @@ type pump struct {
 	exitCode   *int
 	gotError   bool
 	localClose bool
+	// closeBy — setelah frame exit/error: batas akhir menunggu server
+	// menutup. Begitu diisi, ping/pong/frame berikutnya tidak lagi
+	// memperpanjang batas baca (alive).
+	closeBy time.Time
 }
 
 // Pump — salurkan sampai sesi berakhir; kembalikan kode keluar.
@@ -282,7 +286,51 @@ func (p *pump) stopReader(readDone <-chan int) {
 	}
 }
 
-func (p *pump) alive() { _ = p.conn.SetReadDeadline(time.Now().Add(p.o.IdleTimeout)) }
+// alive — ada tanda hidup dari server (frame, ping, pong) atau stdout baru
+// saja menerima data: perpanjang batas baca IdleTimeout — kecuali sesi sudah
+// diakhiri server (closeBy), yang batasnya tetap.
+func (p *pump) alive() {
+	p.mu.Lock()
+	by := p.closeBy
+	p.mu.Unlock()
+	if by.IsZero() {
+		by = time.Now().Add(p.o.IdleTimeout)
+	}
+	_ = p.conn.SetReadDeadline(by)
+}
+
+// closeSoon — server mengakhiri sesi (exit/error): tunggu penutupannya paling
+// lama CloseGrace sejak saat ini, tidak diperpanjang lagi.
+func (p *pump) closeSoon() {
+	p.mu.Lock()
+	if p.closeBy.IsZero() {
+		p.closeBy = time.Now().Add(p.o.CloseGrace)
+	}
+	by := p.closeBy
+	p.mu.Unlock()
+	_ = p.conn.SetReadDeadline(by)
+}
+
+// outWriter — stdout (aliran ke ssh). Galat TULIS ditandai supaya bisa
+// dibedakan dari galat BACA jaringan di tengah frame (keduanya keluar dari
+// io.Copy yang sama). Setiap tulisan yang berhasil memperpanjang batas baca:
+// waktu tertahan di stdout (ssh dihentikan sementara dengan ~^Z, atau lambat
+// menguras) bukan tanda server hilang — selama itu frame ping server memang
+// tidak terbaca.
+type outWriter struct {
+	p   *pump
+	err error
+}
+
+func (w *outWriter) Write(b []byte) (int, error) {
+	n, err := w.p.o.Stdout.Write(b)
+	if err != nil {
+		w.err = err
+		return n, err
+	}
+	w.p.alive()
+	return n, nil
+}
 
 func (p *pump) write(mt int, data []byte) error {
 	p.wmu.Lock()
@@ -338,6 +386,7 @@ func (p *pump) stdinLoop(done chan<- struct{}, stop <-chan struct{}) {
 }
 
 func (p *pump) readLoop() int {
+	out := &outWriter{p: p}
 	for {
 		mt, r, err := p.conn.NextReader()
 		if err != nil {
@@ -346,7 +395,12 @@ func (p *pump) readLoop() int {
 		p.alive()
 		switch mt {
 		case websocket.BinaryMessage:
-			if _, err := io.Copy(p.o.Stdout, r); err != nil {
+			if _, err := io.Copy(out, r); err != nil {
+				if out.err == nil {
+					// Galat BACA di tengah frame: koneksi reset atau batas
+					// waktu — sesi putus, bukan ditutup ssh.
+					return p.ended(err)
+				}
 				// ssh sudah menutup ujung bacanya: tidak ada lagi yang
 				// menunggu byte — tutup rapi.
 				p.mu.Lock()
@@ -387,8 +441,9 @@ func (p *pump) control(data []byte) {
 		p.mu.Lock()
 		p.exitCode = &code
 		p.mu.Unlock()
-		// Server akan menutup; jangan menunggu selamanya.
-		_ = p.conn.SetReadDeadline(time.Now().Add(p.o.CloseGrace))
+		// Server akan menutup; jangan menunggu selamanya (ping server tidak
+		// boleh memperpanjangnya lagi — lihat alive).
+		p.closeSoon()
 	case "error":
 		// Kontrak §7b P11: kalimat server (mis. "image aplikasi ini belum
 		// mendukung SSH; …") dicetak apa adanya — hanya karakter kendali
@@ -403,7 +458,7 @@ func (p *pump) control(data []byte) {
 		p.mu.Unlock()
 		// Sesi sudah gagal: minta server menutup sekarang, jangan menunggu.
 		p.closeWith(websocket.CloseNormalClosure, "")
-		_ = p.conn.SetReadDeadline(time.Now().Add(p.o.CloseGrace))
+		p.closeSoon()
 	}
 }
 

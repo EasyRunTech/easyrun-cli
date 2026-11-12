@@ -228,7 +228,9 @@ func TestSSHPrepareGagal(t *testing.T) {
 func TestSSHArgvDanExec(t *testing.T) {
 	h := newHarness(t)
 	h.loggedIn(t)
-	h.p.hostAlias = "contoh-box.easyrun.io"
+	// Temuan review 12: host_alias jawaban sertifikat diabaikan — HostName
+	// selalu dari /cli/boxes, HostKeyAlias = id box.
+	h.p.hostAlias = "alamat-lama.easyrun.io"
 	h.execRet = 42
 	if code := h.run("ssh", "CONTOH-BOX.easyrun.io", "--", "-L", "8080:localhost:80", "uptime"); code != 42 {
 		t.Fatalf("kode keluar ssh harus diteruskan: %d %s", code, h.stderr)
@@ -242,11 +244,11 @@ func TestSSHArgvDanExec(t *testing.T) {
 	}
 	argv := strings.Join(e.argv, "\n")
 	for _, want := range []string{
-		"ProxyCommand=" + h.exe + " tunnel " + boxID,
+		"ProxyCommand=" + h.invocation() + " tunnel " + boxID,
 		"IdentityFile=" + h.d.KeyPath(),
 		"CertificateFile=" + h.d.CertPath(boxID),
 		"IdentitiesOnly=yes",
-		"HostKeyAlias=contoh-box.easyrun.io",
+		"HostKeyAlias=" + boxID,
 		"UserKnownHostsFile=" + h.d.KnownHostsPath(),
 		"StrictHostKeyChecking=accept-new",
 		"ServerAliveInterval=30",
@@ -317,15 +319,15 @@ func TestSSHConfig(t *testing.T) {
 	}
 	out := h.stdout.String()
 	for _, want := range []string{
-		`Match host contoh-box.easyrun.io exec "` + h.exe + ` ssh-prepare ` + boxID + `"`,
+		`Match host contoh-box.easyrun.io exec "` + h.invocation() + ` ssh-prepare ` + boxID + `"`,
 		"\nHost contoh-box.easyrun.io\n",
 		"    HostName contoh-box.easyrun.io\n",
 		"    User ubuntu\n",
 		"    IdentityFile " + h.d.KeyPath() + "\n",
 		"    CertificateFile " + h.d.CertPath(boxID) + "\n",
 		"    IdentitiesOnly yes\n",
-		"    ProxyCommand " + h.exe + " tunnel " + boxID + "\n",
-		"    HostKeyAlias contoh-box.easyrun.io\n",
+		"    ProxyCommand " + h.invocation() + " tunnel " + boxID + "\n",
+		"    HostKeyAlias " + boxID + "\n",
 		"    UserKnownHostsFile " + h.d.KnownHostsPath() + "\n",
 		"    StrictHostKeyChecking accept-new\n",
 		"    ServerAliveInterval 30\n",
@@ -700,7 +702,7 @@ func TestSSHConfigWriteMengalahkanHostBintang(t *testing.T) {
 		"hostname":     "contoh-box.easyrun.io",
 		"forwardagent": "no",
 		"forwardx11":   "no",
-		"proxycommand": h.exe + " tunnel " + boxID,
+		"proxycommand": h.invocation() + " tunnel " + boxID,
 	}
 	for k, v := range want {
 		if first(got, k) != v {

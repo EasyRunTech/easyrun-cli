@@ -32,6 +32,8 @@ const (
 	sshDirName      = "ssh"
 	knownHostsFile  = "known_hosts"
 	keyFile         = "id_ed25519"
+	clockFile       = "clock.json"
+	certSuffix      = "-cert.pub"
 
 	dirPerm     fs.FileMode = 0o700
 	privatePerm fs.FileMode = 0o600
@@ -61,12 +63,16 @@ type Dir struct {
 	Warn io.Writer
 }
 
-// Locate — EASYRUN_CONFIG_DIR bila diisi, selain itu ~/.easyrun.
-func Locate(getenv func(string) string) (string, error) {
+// Locate — EASYRUN_CONFIG_DIR bila diisi, selain itu ~/.easyrun. homeDir
+// nil = os.UserHomeDir.
+func Locate(getenv func(string) string, homeDir func() (string, error)) (string, error) {
 	if v := getenv(EnvConfigDir); v != "" {
 		return filepath.Abs(v)
 	}
-	home, err := os.UserHomeDir()
+	if homeDir == nil {
+		homeDir = os.UserHomeDir
+	}
+	home, err := homeDir()
 	if err != nil {
 		return "", fmt.Errorf("folder home tidak ditemukan (isi %s): %w", EnvConfigDir, err)
 	}
@@ -84,8 +90,11 @@ func (d Dir) KnownHostsPath() string  { return filepath.Join(d.Path, knownHostsF
 // nama yang diketik) supaya satu box = satu sertifikat walau dipanggil lewat
 // nama, hostname, atau id, dan tetap benar bila box diganti nama.
 func (d Dir) CertPath(boxID string) string {
-	return filepath.Join(d.SSHDir(), boxID+"-cert.pub")
+	return filepath.Join(d.SSHDir(), boxID+certSuffix)
 }
+
+// ClockPath — selisih jam laptop terhadap server (bukan rahasia).
+func (d Dir) ClockPath() string { return filepath.Join(d.Path, clockFile) }
 
 // Ensure — buat folder (dan ssh/) 0700; folder lama yang izinnya terbuka
 // dirapatkan dengan peringatan.
@@ -213,18 +222,54 @@ func (d Dir) RemoveCredentials() error {
 
 // RemoveCertificates — hapus semua sertifikat box (berumur pendek, terikat
 // token). Kunci SSH dibiarkan: bukan rahasia server dan bisa dipakai lagi.
+// Isi folder dibaca langsung (bukan filepath.Glob): path folder yang memuat
+// karakter pola seperti "[" tidak boleh membuat sertifikat lama tertinggal.
 func (d Dir) RemoveCertificates() error {
-	matches, err := filepath.Glob(filepath.Join(d.SSHDir(), "*-cert.pub"))
+	entries, err := os.ReadDir(d.SSHDir())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	var errs []error
-	for _, m := range matches {
-		if err := os.Remove(m); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), certSuffix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(d.SSHDir(), e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ClockOffset — selisih jam server dikurangi jam laptop, diukur dari header
+// Date saat sertifikat terakhir diterbitkan.
+type ClockOffset struct {
+	OffsetSeconds int64     `json:"offset_seconds"`
+	MeasuredAt    time.Time `json:"measured_at,omitzero"`
+}
+
+// Offset — sebagai durasi.
+func (c ClockOffset) Offset() time.Duration { return time.Duration(c.OffsetSeconds) * time.Second }
+
+// LoadClockOffset — nol bila belum pernah diukur atau berkasnya rusak (jam
+// laptop lalu dipercaya apa adanya).
+func (d Dir) LoadClockOffset() ClockOffset {
+	var c ClockOffset
+	b, err := os.ReadFile(d.ClockPath())
+	if err != nil || json.Unmarshal(b, &c) != nil {
+		return ClockOffset{}
+	}
+	return c
+}
+
+func (d Dir) SaveClockOffset(c ClockOffset) error {
+	if err := d.Ensure(); err != nil {
+		return err
+	}
+	return writeJSON(d.ClockPath(), c)
 }
 
 func writeJSON(path string, v any) error {
@@ -235,39 +280,48 @@ func writeJSON(path string, v any) error {
 	return WriteFileAtomic(path, append(b, '\n'), privatePerm)
 }
 
-// WriteFileAtomic — tulis ke berkas sementara di folder yang sama (dibuat
-// 0600 oleh os.CreateTemp), fsync, lalu rename: pembaca tidak pernah melihat
-// berkas setengah jadi, dan izin tidak pernah sempat terbuka.
-func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
+// writeTemp — tulis data ke berkas sementara di folder path (dibuat 0600 oleh
+// os.CreateTemp lalu diberi perm), fsync, tutup. Kembalikan namanya; pemanggil
+// yang memindahkan atau menghapusnya.
+func writeTemp(path string, data []byte, perm fs.FileMode) (string, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	fail := func(err error) (string, error) {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
+		return fail(err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+// WriteFileAtomic — tulis ke berkas sementara di folder yang sama, fsync,
+// lalu rename: pembaca tidak pernah melihat berkas setengah jadi, dan izin
+// tidak pernah sempat terbuka.
+func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
+	name, err := writeTemp(path, data, perm)
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
-	defer func() {
-		if name != "" {
-			_ = os.Remove(name)
-		}
-	}()
-	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
 	if err := os.Rename(name, path); err != nil {
+		_ = os.Remove(name)
 		return err
 	}
-	name = ""
 	return nil
 }
 
@@ -275,48 +329,66 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) error {
 // bila berkas tujuan sudah ada. Dipakai saat membuat kunci SSH supaya dua
 // proses yang berjalan bersamaan (VS Code membuka beberapa sambungan) tidak
 // saling menimpa kunci.
+//
+// Hard link = buat-bila-belum-ada yang atomik. Sistem berkas tanpa hard link
+// jatuh ke O_EXCL: berkas tujuan lalu terlihat sesaat dalam keadaan setengah
+// tertulis, jadi pembaca yang mendapat fs.ErrExist harus siap mengulang
+// (lihat ReadFileSettled).
 func WriteFileExclusive(path string, data []byte, perm fs.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	name, err := writeTemp(path, data, perm)
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
 	defer func() { _ = os.Remove(name) }()
-	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
-		_ = tmp.Close()
-		return err
+	err = os.Link(name, path)
+	if err == nil {
+		return nil
 	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
+	if errors.Is(err, fs.ErrExist) {
+		return fs.ErrExist
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	// Hard link = buat-bila-belum-ada yang atomik.
-	if err := os.Link(name, path); err != nil {
-		if errors.Is(err, fs.ErrExist) {
+	f, ferr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if ferr != nil {
+		if errors.Is(ferr, fs.ErrExist) {
 			return fs.ErrExist
 		}
-		// Sistem berkas tanpa hard link: jatuh ke O_EXCL biasa.
-		f, ferr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
-		if ferr != nil {
-			if errors.Is(ferr, fs.ErrExist) {
-				return fs.ErrExist
-			}
-			return ferr
-		}
-		if _, werr := f.Write(data); werr != nil {
-			_ = f.Close()
-			return werr
-		}
-		return f.Close()
+		return ferr
 	}
-	return nil
+	if _, werr := f.Write(data); werr != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return werr
+	}
+	if serr := f.Sync(); serr != nil {
+		_ = f.Close()
+		return serr
+	}
+	return f.Close()
+}
+
+// settleTries, settleWait — ReadFileSettled mengulang paling lama ±2 detik.
+const (
+	settleTries = 40
+	settleWait  = 50 * time.Millisecond
+)
+
+// ReadFileSettled — baca berkas yang baru saja dibuat proses lain lewat
+// WriteFileExclusive: ulangi selama valid(isi) gagal (berkas masih setengah
+// tertulis di sistem berkas tanpa hard link). Galat valid terakhir
+// dikembalikan bila isinya tidak pernah lengkap.
+func ReadFileSettled(path string, valid func([]byte) error) ([]byte, error) {
+	var lastErr error
+	for i := 0; i < settleTries; i++ {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if lastErr = valid(b); lastErr == nil {
+			return b, nil
+		}
+		time.Sleep(settleWait)
+	}
+	return nil, lastErr
 }
 
 // NormalizeAPIURL — origin API panel yang aman dipakai: https, atau http

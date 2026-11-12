@@ -72,10 +72,11 @@ Barisnya harus di atas karena ssh memakai nilai **pertama** yang ditemukannya un
 | `easyrun logout` | Cabut token CLI di server, hapus token dan sertifikat dari laptop. |
 | `easyrun boxes` | Tabel box: nama, hostname, tenant, status, SSH tersedia, id. |
 | `easyrun ssh <box> [-- argumen ssh…]` | Perbarui sertifikat bila sisa < 5 menit, lalu jalankan `ssh` sistem. Argumen setelah `--` diteruskan apa adanya, mis. `-- -L 8080:localhost:8080`. |
-| `easyrun ssh-config <box> [--write]` | Blok `Match host … exec "easyrun ssh-prepare …"` + `Host …`. Tanpa `--write` blok dicetak. Dengan `--write` blok ditulis ke `~/.ssh/easyrun/<id>.conf`, ditambah satu baris `Include` di puncak `~/.ssh/config`. |
+| `easyrun ssh-config <box> [--write]` | Blok `Match host … exec "easyrun --config-dir … ssh-prepare …"` + `Host …`. Folder data (dan alamat API bila diisi lewat env/opsi) ikut ditulis di perintahnya, karena `ssh`, `scp`, dan VS Code tidak selalu mewarisi env shell. Tanpa `--write` blok dicetak. Dengan `--write` blok ditulis ke `~/.ssh/easyrun/<id>.conf`, blok lama untuk nama yang sama (box lain) dihapus, dan satu baris `Include` ditambahkan di puncak `~/.ssh/config`. `~` = home akun yang dibaca OpenSSH. |
 | `easyrun ssh-prepare <box>` | Hanya memperbarui sertifikat bila perlu (dipanggil blok `Match exec`). Tanpa jaringan selama sertifikat masih segar. |
 | `easyrun tunnel <box>` | ProxyCommand: saluran SSH lewat WebSocket HTTPS panel. Dipanggil `ssh`, bukan untuk diketik. |
 | `easyrun --version`, `--help`, `--self-update` | Versi, bantuan, pembaruan. |
+| `easyrun --config-dir DIR --api-url URL <perintah> …` | Opsi global (sebelum nama perintah), menggantikan `EASYRUN_CONFIG_DIR` / `EASYRUN_API_URL`. |
 
 Butuh OpenSSH (`ssh`) di PATH: sudah ada di macOS dan kebanyakan Linux; Windows: fitur "OpenSSH Client".
 
@@ -97,7 +98,8 @@ Semua di `~/.easyrun/` (folder 0700):
 | `credentials.json` | token CLI (`erc_…`), id token, email, kedaluwarsa, dan alamat API penerbitnya | 0600 |
 | `ssh/id_ed25519`, `ssh/id_ed25519.pub` | kunci SSH khusus easyrun, dibuat otomatis | 0600 / 0644 |
 | `ssh/<id-box>-cert.pub` | sertifikat SSH berumur pendek (bawaan 1 jam) untuk satu box | 0600 |
-| `known_hosts` | kunci host box (`StrictHostKeyChecking accept-new`, per hostname box) | dibuat `ssh` |
+| `known_hosts` | kunci host box (`StrictHostKeyChecking accept-new`, per id box: tetap berlaku bila alamat box diganti, dan hostname bekas box lain tidak memicu "host key changed") | dibuat `ssh` |
+| `clock.json` | selisih jam laptop dengan server (dari header `Date`), supaya umur sertifikat dinilai dengan jam server | 0600 |
 
 `ssh-config --write` juga menulis di luar `~/.easyrun/`:
 

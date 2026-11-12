@@ -648,3 +648,103 @@ func TestErrorTercetakSebelumSelesaiDanTidakMenunggu(t *testing.T) {
 		})
 	}
 }
+
+// Temuan review 2: koneksi putus DI TENGAH frame biner adalah sesi putus
+// (kode 1 + pesan), bukan "ssh menutup ujung bacanya" (kode 0 diam-diam).
+func TestPutusDiTengahFrameBukanTutupRapi(t *testing.T) {
+	url := wsServer(t, func(c *websocket.Conn, r *http.Request) {
+		text(c, `{"type":"ready"}`)
+		w, err := c.NextWriter(websocket.BinaryMessage)
+		if err != nil {
+			return
+		}
+		// Lebih besar dari buffer tulis: fragmen awal (bukan final) sudah
+		// terkirim, lalu koneksi diputus sebelum frame selesai.
+		_, _ = w.Write(payload(256<<10, 3))
+		_ = c.UnderlyingConn().Close()
+	})
+	var stderr lockedBuffer
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+	code := Pump(context.Background(), dial(t, url), Options{Stdin: stdinR, Stdout: io.Discard, Stderr: &stderr})
+	if code != 1 || !strings.Contains(stderr.String(), "terputus") {
+		t.Fatalf("kode %d stderr %q", code, stderr.String())
+	}
+}
+
+// Temuan review 4: setelah frame exit, ping server tidak boleh memperpanjang
+// batas tunggu penutupan (CloseGrace) — tunnel tetap selesai.
+func TestSetelahExitPingTidakMemperpanjang(t *testing.T) {
+	stop := make(chan struct{})
+	url := wsServer(t, func(c *websocket.Conn, r *http.Request) {
+		text(c, `{"type":"ready"}`)
+		text(c, `{"type":"exit","code":3}`)
+		tk := time.NewTicker(20 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				if c.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil {
+					return
+				}
+			}
+		}
+	})
+	defer close(stop)
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+	done := make(chan int, 1)
+	go func() {
+		done <- Pump(context.Background(), dial(t, url), Options{
+			Stdin: stdinR, Stdout: io.Discard, Stderr: io.Discard,
+			CloseGrace: 200 * time.Millisecond, IdleTimeout: 5 * time.Second,
+		})
+	}()
+	select {
+	case code := <-done:
+		if code != 3 {
+			t.Fatalf("kode %d, ingin 3", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("tunnel tidak selesai: ping server terus memperpanjang batas tunggu setelah exit")
+	}
+}
+
+// slowWriter — stdout yang tertahan sekali (ssh dihentikan sementara).
+type slowWriter struct {
+	once sync.Once
+	d    time.Duration
+	buf  lockedBuffer
+}
+
+func (w *slowWriter) Write(b []byte) (int, error) {
+	w.once.Do(func() { time.Sleep(w.d) })
+	return w.buf.Write(b)
+}
+
+// Temuan review 5: waktu tertahan menulis ke stdout tidak dihitung sebagai
+// server diam.
+func TestStdoutTertahanBukanServerDiam(t *testing.T) {
+	url := wsServer(t, func(c *websocket.Conn, r *http.Request) {
+		text(c, `{"type":"ready"}`)
+		_ = c.WriteMessage(websocket.BinaryMessage, []byte("satu"))
+		time.Sleep(50 * time.Millisecond)
+		_ = c.WriteMessage(websocket.BinaryMessage, []byte("dua"))
+		text(c, `{"type":"exit","code":0}`)
+		closeNormal(c)
+		drain(c)
+	})
+	var stderr lockedBuffer
+	stdinR, stdinW := io.Pipe()
+	defer stdinW.Close()
+	w := &slowWriter{d: 600 * time.Millisecond}
+	code := Pump(context.Background(), dial(t, url), Options{
+		Stdin: stdinR, Stdout: w, Stderr: &stderr,
+		IdleTimeout: 200 * time.Millisecond, CloseGrace: time.Second,
+	})
+	if code != 0 || w.buf.String() != "satudua" || stderr.String() != "" {
+		t.Fatalf("kode %d stdout %q stderr %q", code, w.buf.String(), stderr.String())
+	}
+}

@@ -38,9 +38,11 @@ type App struct {
 	Hostname   func() (string, error)
 	Executable func() (string, error)
 	LookPath   func(string) (string, error)
-	// HomeDir — folder home untuk ~/.ssh (`ssh-config --write`); nil =
-	// os.UserHomeDir.
+	// HomeDir — folder home ($HOME) untuk ~/.easyrun; nil = os.UserHomeDir.
 	HomeDir func() (string, error)
+	// SSHHomeDir — folder home yang dipakai OpenSSH untuk ~/.ssh/config dan
+	// "~" di Include: home akun (passwd), bukan $HOME. nil = HomeDir.
+	SSHHomeDir func() (string, error)
 	// OpenBrowser — buka URL (sudah divalidasi https) di browser.
 	OpenBrowser func(string) error
 	// ExecSSH — jalankan ssh. Unix: menggantikan proses (tidak kembali bila
@@ -57,27 +59,35 @@ type App struct {
 	// sshUser — hanya untuk uji ujung-ke-ujung dengan sshd lokal (sshd
 	// non-root hanya melayani pengguna yang menjalankannya); "" = ubuntu.
 	sshUser string
+
+	// configDirOpt, apiURLOpt — opsi global --config-dir / --api-url (sebelum
+	// nama perintah). Blok ssh-config membawanya ke ProxyCommand dan Match
+	// exec, karena ssh/VS Code tidak selalu mewarisi env shell.
+	configDirOpt string
+	apiURLOpt    string
 }
 
 // New — App dengan ketergantungan sungguhan.
 func New(stdin io.Reader, stdout, stderr io.Writer) *App {
-	return &App{
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		Getenv:      os.Getenv,
-		Environ:     os.Environ,
-		Now:         time.Now,
-		HTTP:        api.NewHTTPClient(),
-		Sleep:       sleepCtx,
-		Hostname:    os.Hostname,
-		Executable:  os.Executable,
-		LookPath:    exec.LookPath,
-		HomeDir:     os.UserHomeDir,
-		OpenBrowser: openBrowser,
-		ExecSSH:     execSSH,
-		GOOS:        runtime.GOOS,
+	a := &App{
+		Stdin:      stdin,
+		Stdout:     stdout,
+		Stderr:     stderr,
+		Getenv:     os.Getenv,
+		Environ:    os.Environ,
+		Now:        time.Now,
+		HTTP:       api.NewHTTPClient(),
+		Sleep:      sleepCtx,
+		Hostname:   os.Hostname,
+		Executable: os.Executable,
+		LookPath:   exec.LookPath,
+		HomeDir:    os.UserHomeDir,
+		SSHHomeDir: accountHomeDir,
+		ExecSSH:    execSSH,
+		GOOS:       runtime.GOOS,
 	}
+	a.OpenBrowser = a.openBrowser
+	return a
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -135,14 +145,22 @@ Contoh:
   easyrun ssh uji-box -- -L 8080:localhost:8080
   easyrun ssh-config uji-box --write   lalu: ssh uji-box, scp, VS Code
 
+Opsi global (sebelum nama perintah):
+  --config-dir DIR   folder konfigurasi (menggantikan %s)
+  --api-url URL      alamat API panel (menggantikan %s)
+
 Env: %s (alamat API, bawaan %s), %s (folder, bawaan ~/.easyrun), %s
-`, config.EnvAPIURL, config.DefaultAPIURL, config.EnvConfigDir, EnvNoBrowser)
+`, config.EnvConfigDir, config.EnvAPIURL, config.EnvAPIURL, config.DefaultAPIURL, config.EnvConfigDir, EnvNoBrowser)
 }
 
 // Run — jalankan satu perintah; kembalikan kode keluar.
 func (a *App) Run(ctx context.Context, args []string) int {
 	if a.GOOS == "" {
 		a.GOOS = runtime.GOOS
+	}
+	args, code, ok := a.globalOptions(args)
+	if !ok {
+		return code
 	}
 	if len(args) == 0 {
 		a.usage(a.Stdout)
@@ -169,6 +187,38 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		}
 	}
 	return a.unknown(args[0])
+}
+
+// globalOptions — ambil --config-dir / --api-url di depan nama perintah
+// (bentuk "--opsi nilai" atau "--opsi=nilai"). ok=false → keluar dengan code.
+func (a *App) globalOptions(args []string) (rest []string, code int, ok bool) {
+	for len(args) > 0 {
+		name, val, hasVal := strings.Cut(args[0], "=")
+		var dst *string
+		switch name {
+		case "--config-dir":
+			dst = &a.configDirOpt
+		case "--api-url":
+			dst = &a.apiURLOpt
+		default:
+			return args, 0, true
+		}
+		if !hasVal {
+			if len(args) < 2 {
+				fmt.Fprintf(a.Stderr, "easyrun: opsi %s butuh nilai\n", name)
+				return nil, 2, false
+			}
+			val, args = args[1], args[2:]
+		} else {
+			args = args[1:]
+		}
+		if strings.TrimSpace(val) == "" {
+			fmt.Fprintf(a.Stderr, "easyrun: opsi %s tidak boleh kosong\n", name)
+			return nil, 2, false
+		}
+		*dst = val
+	}
+	return args, 0, true
 }
 
 // unknown — kontrak §6: perintah yang belum ada → "belum tersedia" (bisa jadi
@@ -227,9 +277,16 @@ func (a *App) usageError(c string, msg string) int {
 	return 2
 }
 
-// dir — folder konfigurasi, dibuat bila belum ada.
+// dir — folder konfigurasi, dibuat bila belum ada. Urutan: --config-dir →
+// EASYRUN_CONFIG_DIR → ~/.easyrun.
 func (a *App) dir() (config.Dir, error) {
-	p, err := config.Locate(a.Getenv)
+	var p string
+	var err error
+	if a.configDirOpt != "" {
+		p, err = filepath.Abs(a.configDirOpt)
+	} else {
+		p, err = config.Locate(a.Getenv, a.HomeDir)
+	}
 	if err != nil {
 		return config.Dir{}, err
 	}
@@ -258,7 +315,7 @@ func (a *App) session(d config.Dir) (*api.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	base, err := config.ResolveAPIURL("", a.Getenv, cfg)
+	base, err := config.ResolveAPIURL(a.apiURLOpt, a.Getenv, cfg)
 	if err != nil {
 		return nil, err
 	}

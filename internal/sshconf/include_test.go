@@ -29,7 +29,7 @@ func perm(t *testing.T, p string) os.FileMode {
 
 func TestEnsureIncludeBerkasBaru(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), ".ssh", "config")
-	res, err := EnsureInclude(cfg)
+	res, err := EnsureInclude(cfg, t.TempDir())
 	if err != nil || !res.Created || !res.Inserted || res.Backup != "" {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -45,7 +45,7 @@ func TestEnsureIncludeBerkasBaru(t *testing.T) {
 		}
 	}
 	// Idempoten.
-	res, err = EnsureInclude(cfg)
+	res, err = EnsureInclude(cfg, t.TempDir())
 	if err != nil || res.Inserted || res.Created {
 		t.Fatalf("panggilan kedua: %+v %v", res, err)
 	}
@@ -58,7 +58,7 @@ func TestEnsureIncludeMenyisipkanSatuBarisSaja(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(orig), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := EnsureInclude(cfg)
+	res, err := EnsureInclude(cfg, t.TempDir())
 	if err != nil || !res.Inserted || res.Created || res.Backup != cfg+BackupSuffix {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -77,7 +77,7 @@ func TestEnsureIncludeMenyisipkanSatuBarisSaja(t *testing.T) {
 		}
 	}
 	// Idempoten: tidak disisipi lagi, cadangan tidak disentuh.
-	if res, err := EnsureInclude(cfg); err != nil || res.Inserted || res.Backup != "" {
+	if res, err := EnsureInclude(cfg, t.TempDir()); err != nil || res.Inserted || res.Backup != "" {
 		t.Fatalf("panggilan kedua: %+v %v", res, err)
 	}
 	if got := readFile(t, cfg); strings.Count(got, IncludeLine) != 1 {
@@ -88,7 +88,7 @@ func TestEnsureIncludeMenyisipkanSatuBarisSaja(t *testing.T) {
 	// tetapi cadangan tetap isi ASLI (dibuat sekali saja).
 	edited := orig + "Host baru\n    User saya\n"
 	_ = os.WriteFile(cfg, []byte(edited), 0o644)
-	if res, err := EnsureInclude(cfg); err != nil || !res.Inserted || res.Backup != "" {
+	if res, err := EnsureInclude(cfg, t.TempDir()); err != nil || !res.Inserted || res.Backup != "" {
 		t.Fatalf("sisip ulang: %+v %v", res, err)
 	}
 	if got := readFile(t, cfg); got != IncludeLine+"\n"+edited {
@@ -112,7 +112,7 @@ func TestEnsureIncludeSudahDiAtas(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := filepath.Join(t.TempDir(), "config")
 			_ = os.WriteFile(cfg, []byte(orig), 0o600)
-			res, err := EnsureInclude(cfg)
+			res, err := EnsureInclude(cfg, t.TempDir())
 			if err != nil || res.Inserted || len(res.Stale) != 0 {
 				t.Fatalf("%+v %v", res, err)
 			}
@@ -130,7 +130,7 @@ func TestEnsureIncludeDiBawahHostBintang(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config")
 	orig := "Host *\n    User root\n" + IncludeLine + "\n"
 	_ = os.WriteFile(cfg, []byte(orig), 0o600)
-	res, err := EnsureInclude(cfg)
+	res, err := EnsureInclude(cfg, t.TempDir())
 	if err != nil || !res.Inserted || !reflect.DeepEqual(res.Stale, []int{3}) {
 		t.Fatalf("%+v %v", res, err)
 	}
@@ -139,7 +139,7 @@ func TestEnsureIncludeDiBawahHostBintang(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 	// Panggilan berikutnya: sudah di atas; baris lama tetap dilaporkan.
-	res, err = EnsureInclude(cfg)
+	res, err = EnsureInclude(cfg, t.TempDir())
 	if err != nil || res.Inserted || !reflect.DeepEqual(res.Stale, []int{4}) {
 		t.Fatalf("kedua: %+v %v", res, err)
 	}
@@ -147,7 +147,7 @@ func TestEnsureIncludeDiBawahHostBintang(t *testing.T) {
 	// Host) akan menang → tidak dianggap "di atas".
 	cfg2 := filepath.Join(t.TempDir(), "config")
 	_ = os.WriteFile(cfg2, []byte("ForwardAgent yes\n"+IncludeLine+"\n"), 0o600)
-	if res, err := EnsureInclude(cfg2); err != nil || !res.Inserted {
+	if res, err := EnsureInclude(cfg2, t.TempDir()); err != nil || !res.Inserted {
 		t.Fatalf("global sebelum Include: %+v %v", res, err)
 	}
 }
@@ -156,7 +156,7 @@ func TestEnsureIncludeCRLFDanBOM(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config")
 	orig := "\xef\xbb\xbfHost *\r\n    User root\r\n"
 	_ = os.WriteFile(cfg, []byte(orig), 0o600)
-	if _, err := EnsureInclude(cfg); err != nil {
+	if _, err := EnsureInclude(cfg, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	if got := readFile(t, cfg); got != "\xef\xbb\xbf"+IncludeLine+"\r\nHost *\r\n    User root\r\n" {
@@ -177,7 +177,7 @@ func TestEnsureIncludeSymlinkDotfiles(t *testing.T) {
 	if err := os.Symlink(real, cfg); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := EnsureInclude(cfg); err != nil || !res.Inserted {
+	if res, err := EnsureInclude(cfg, t.TempDir()); err != nil || !res.Inserted {
 		t.Fatalf("%+v %v", res, err)
 	}
 	if fi, err := os.Lstat(cfg); err != nil || fi.Mode()&os.ModeSymlink == 0 {
@@ -189,7 +189,7 @@ func TestEnsureIncludeSymlinkDotfiles(t *testing.T) {
 	// Symlink putus → galat, bukan menimpa symlink.
 	broken := filepath.Join(dir, "putus")
 	_ = os.Symlink(filepath.Join(dir, "tidak-ada"), broken)
-	if _, err := EnsureInclude(broken); err == nil {
+	if _, err := EnsureInclude(broken, t.TempDir()); err == nil {
 		t.Fatal("symlink putus harus galat")
 	}
 }
@@ -216,5 +216,88 @@ func TestWriteBoxConf(t *testing.T) {
 	}
 	if _, _, err := WriteBoxConf(sshDir, "../keluar", "x"); err == nil {
 		t.Fatal("id dengan path harus ditolak")
+	}
+}
+
+// Temuan review 8: Include lain di atas baris kita yang memuat `Host *`
+// ber-opsi bentrok membuat baris kita disisipkan di baris 1; Include yang
+// hanya untuk host tertentu (OrbStack) atau opsi tak berbahaya dibiarkan.
+func TestEnsureIncludeIncludeLainYangMembayangi(t *testing.T) {
+	cases := []struct {
+		name, included string
+		shadow         bool
+	}{
+		{"host tertentu", "Host orb\n    User orb\n    ProxyCommand orb-proxy\n", false},
+		{"host bintang tak berbahaya", "Host *\n    UseKeychain yes\n    AddKeysToAgent yes\n    IdentityFile ~/.ssh/id_ed25519\n", false},
+		{"host bintang User", "Host *\n    User root\n", true},
+		{"di luar blok ProxyJump", "ProxyJump bastion\nHost lain\n    User x\n", true},
+		{"match all ForwardAgent", "Match all\n    ForwardAgent yes\n", true},
+		{"bersarang", "Include dalam.conf\n", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			sshDir := filepath.Join(home, ".ssh")
+			_ = os.MkdirAll(sshDir, 0o700)
+			_ = os.WriteFile(filepath.Join(sshDir, "lain.conf"), []byte(c.included), 0o600)
+			_ = os.WriteFile(filepath.Join(sshDir, "dalam.conf"), []byte("Host *\n    User root\n"), 0o600)
+			cfg := filepath.Join(sshDir, "config")
+			orig := "Include ~/.ssh/lain.conf\n" + IncludeLine + "\n\nHost kerja\n    User budi\n"
+			_ = os.WriteFile(cfg, []byte(orig), 0o600)
+			res, err := EnsureInclude(cfg, home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := readFile(t, cfg)
+			if !c.shadow {
+				if res.Inserted || got != orig || len(res.Shadowing) != 0 {
+					t.Fatalf("harus dibiarkan: %+v\n%s", res, got)
+				}
+				return
+			}
+			if !res.Inserted || !strings.HasPrefix(got, IncludeLine+"\n") || got != IncludeLine+"\n"+orig {
+				t.Fatalf("baris kita harus di baris 1: %+v\n%s", res, got)
+			}
+			if len(res.Shadowing) == 0 || !reflect.DeepEqual(res.Stale, []int{2}) {
+				t.Fatalf("hasil %+v", res)
+			}
+			// Idempoten: jalan kedua tidak menyisipkan lagi.
+			if res2, err := EnsureInclude(cfg, home); err != nil || res2.Inserted {
+				t.Fatalf("jalan kedua: %+v %v", res2, err)
+			}
+		})
+	}
+}
+
+// Temuan review 3: blok buatan easyrun untuk alias yang sama (box lain)
+// dihapus; milik box ini dan berkas buatan tangan dibiarkan.
+func TestRemoveStaleConfs(t *testing.T) {
+	sshDir := t.TempDir()
+	dir := filepath.Join(sshDir, IncludeDirName)
+	_ = os.MkdirAll(dir, 0o700)
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		_ = os.WriteFile(p, []byte(body), 0o600)
+		return p
+	}
+	mark := "# Ditulis ulang oleh `easyrun ssh-config uji --write`; perubahan manual akan tertimpa.\n"
+	old := write("aaaa.conf", mark+"Match host uji exec \"easyrun ssh-prepare aaaa\"\n\nHost uji\n    HostName lama.easyrun.io\n")
+	keep := write("ffff.conf", mark+"Host uji\n    HostName baru.easyrun.io\n")
+	other := write("bbbb.conf", mark+"Host lain\n    HostName lain.easyrun.io\n")
+	hand := write("00.conf", "Host UJI\n    User root\n")
+	res, err := RemoveStaleConfs(sshDir, "ffff", "uji")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(res.Removed, []string{old}) || !reflect.DeepEqual(res.Foreign, []string{hand}) {
+		t.Fatalf("%+v", res)
+	}
+	for _, p := range []string{keep, other, hand} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s harus tetap ada", p)
+		}
+	}
+	if _, err := RemoveStaleConfs(t.TempDir(), "ffff", "uji"); err != nil {
+		t.Fatal("folder belum ada harus sukses")
 	}
 }

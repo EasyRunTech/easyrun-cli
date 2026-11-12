@@ -29,6 +29,9 @@ const (
 	RequestTimeout = 30 * time.Second
 	// maxMessageLen — pesan server dipotong sepanjang ini sebelum dicetak.
 	maxMessageLen = 300
+	// maxInterval — interval polling (detik) dari server di atas ini dianggap
+	// rusak dan diabaikan.
+	maxInterval = 600
 )
 
 // Kode galat alur device (RFC 8628 §3.5).
@@ -108,6 +111,9 @@ type Error struct {
 	Reason     string // data.reason bila ada (ReasonRateLimited / ReasonSessionLimit), huruf kecil
 	RequestID  string
 	RetryAfter time.Duration
+	// Interval — `data.interval` (detik) yang dikirim panel bersama
+	// slow_down: jeda polling baru yang diminta server; 0 = tidak ada.
+	Interval int
 	// Handshake — penolakan jabat tangan WebSocket (/console/ws?ticket=),
 	// bukan panggilan API ber-token. 401 di sana soal tiket 30 detik.
 	Handshake bool
@@ -141,6 +147,7 @@ type envelope struct {
 	Data      json.RawMessage `json:"data"`
 	Error     json.RawMessage `json:"error"`
 	Code      json.RawMessage `json:"code"`
+	Interval  json.RawMessage `json:"interval"`
 	RequestID string          `json:"request_id"`
 }
 
@@ -157,6 +164,7 @@ func ErrorFromResponse(status int, header http.Header, body []byte, now time.Tim
 		e.RequestID = Clean(env.RequestID)
 		e.Code = firstCode(env)
 		e.Reason = dataReason(env)
+		e.Interval = dataInterval(env)
 	} else if s := strings.TrimSpace(string(body)); s != "" && !strings.HasPrefix(s, "<") {
 		e.Message = Clean(s)
 	}
@@ -208,6 +216,23 @@ func dataReason(env envelope) string {
 	return strings.ToLower(rawString(d.Reason))
 }
 
+// dataInterval — `data.interval` (detik, bilangan bulat positif) atau
+// `interval` tingkat atas (RFC 8628); 0 bila tidak ada atau rusak.
+func dataInterval(env envelope) int {
+	var d struct {
+		Interval json.RawMessage `json:"interval"`
+	}
+	raw := env.Interval
+	if len(env.Data) > 0 && json.Unmarshal(env.Data, &d) == nil && len(d.Interval) > 0 {
+		raw = d.Interval
+	}
+	var n float64
+	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil || n <= 0 || n > maxInterval || n != float64(int(n)) {
+		return 0
+	}
+	return int(n)
+}
+
 func rawString(r json.RawMessage) string {
 	var s string
 	if len(r) == 0 || json.Unmarshal(r, &s) != nil {
@@ -234,13 +259,16 @@ func ParseRetryAfter(v string, now time.Time) time.Duration {
 }
 
 // Clean — buang karakter kendali (cegah sisipan escape terminal dari teks
-// server) dan potong panjangnya.
+// server), karakter format Unicode (pembalik arah U+202A–U+202E dan
+// U+2066–U+2069, karakter tanpa lebar, BOM — bisa membuat teks tampil
+// terbalik atau menyamarkan nama box), pemisah baris/paragraf Unicode, lalu
+// potong panjangnya.
 func Clean(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if r == '\t' {
 			return ' '
 		}
-		if unicode.IsControl(r) || r == ' ' || r == ' ' {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
 			return -1
 		}
 		return r
@@ -255,18 +283,24 @@ func Clean(s string) string {
 // do — kirim permintaan JSON, buka envelope, isi out dengan `data` (atau
 // seluruh badan bila tanpa envelope).
 func (c *Client) do(ctx context.Context, method, path string, in, out any, auth bool) error {
+	_, err := c.doHeader(ctx, method, path, in, out, auth)
+	return err
+}
+
+// doHeader — seperti do, sekaligus mengembalikan header jawaban sukses.
+func (c *Client) doHeader(ctx context.Context, method, path string, in, out any, auth bool) (http.Header, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body = bytes.NewReader(b)
 	}
 	u := c.BaseURL + apiPrefix + path
 	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if in != nil {
@@ -277,7 +311,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, auth 
 	}
 	if auth {
 		if c.Token == "" {
-			return &Error{Status: http.StatusUnauthorized, Message: "belum masuk"}
+			return nil, &Error{Status: http.StatusUnauthorized, Message: "belum masuk"}
 		}
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
@@ -292,28 +326,28 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, auth 
 	resp, err := noFollow.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
-		return &NetError{Host: hostOf(c.BaseURL), Err: unwrapURLError(err)}
+		return nil, &NetError{Host: hostOf(c.BaseURL), Err: unwrapURLError(err)}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
-		return &NetError{Host: hostOf(c.BaseURL), Err: err}
+		return nil, &NetError{Host: hostOf(c.BaseURL), Err: err}
 	}
 	if len(raw) > maxBody {
-		return fmt.Errorf("respons %s %s terlalu besar", method, path)
+		return nil, fmt.Errorf("respons %s %s terlalu besar", method, path)
 	}
 	if err := RedirectFromResponse(resp.StatusCode, resp.Header); err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return ErrorFromResponse(resp.StatusCode, resp.Header, raw, time.Now())
+		return nil, ErrorFromResponse(resp.StatusCode, resp.Header, raw, time.Now())
 	}
 	if out == nil {
-		return nil
+		return resp.Header, nil
 	}
-	return decodeData(raw, out)
+	return resp.Header, decodeData(raw, out)
 }
 
 func decodeData(raw []byte, out any) error {
@@ -405,6 +439,9 @@ type Certificate struct {
 	ExpiresAt   string `json:"expires_at"`
 	Principal   string `json:"principal"`
 	HostAlias   string `json:"host_alias"`
+	// ServerDate — header Date jawaban (jam server saat sertifikat
+	// diterbitkan); zero bila tidak ada. Dipakai mengukur selisih jam laptop.
+	ServerDate time.Time `json:"-"`
 }
 
 // Ticket — jawaban POST /instances/:id/ssh/ticket.
@@ -461,11 +498,15 @@ func (c *Client) Logout(ctx context.Context) error {
 func (c *Client) Certificate(ctx context.Context, boxID, publicKey string) (*Certificate, error) {
 	var out Certificate
 	path := "/instances/" + url.PathEscape(boxID) + "/ssh/certificate"
-	if err := c.do(ctx, http.MethodPost, path, map[string]string{"public_key": publicKey}, &out, true); err != nil {
+	h, err := c.doHeader(ctx, http.MethodPost, path, map[string]string{"public_key": publicKey}, &out, true)
+	if err != nil {
 		return nil, err
 	}
 	if out.Certificate == "" {
 		return nil, errors.New("respons sertifikat kosong")
+	}
+	if t, err := http.ParseTime(h.Get("Date")); err == nil {
+		out.ServerDate = t
 	}
 	return &out, nil
 }

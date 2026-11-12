@@ -136,6 +136,8 @@ func TestCheckSertifikat(t *testing.T) {
 		why  string
 	}{
 		{"segar 1 jam", mk(key, box, now.Add(time.Hour), ssh.UserCert), true, ""},
+		// Temuan review 10: UUID tidak membedakan huruf besar/kecil.
+		{"principal huruf besar", mk(key, strings.ToUpper(box), now.Add(time.Hour), ssh.UserCert), true, ""},
 		{"sisa tepat 5 menit", mk(key, box, now.Add(5*time.Minute), ssh.UserCert), true, ""},
 		{"sisa 4m59s", mk(key, box, now.Add(5*time.Minute-time.Second), ssh.UserCert), false, "sisa umur"},
 		{"kedaluwarsa", mk(key, box, now.Add(-time.Second), ssh.UserCert), false, "kedaluwarsa"},

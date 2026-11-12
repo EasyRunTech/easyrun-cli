@@ -250,7 +250,7 @@ func TestE2ESSHLewatTunnelKeSshd(t *testing.T) {
 		t.Fatalf("perintah tidak jalan (kode %d)\nssh stderr:\n%s\nlog sshd:\n%s", code, sshErr.String(), log)
 	}
 	known, _ := os.ReadFile(d.KnownHostsPath())
-	if !strings.HasPrefix(string(known), "contoh-box.easyrun.io ") {
+	if !strings.HasPrefix(string(known), boxID+" ") {
 		t.Fatalf("known_hosts harus memakai HostKeyAlias: %q", known)
 	}
 
@@ -341,7 +341,7 @@ func TestGalatTunnelTampilSebelumPesanSSH(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy, err := sshconf.ProxyCommand(self, boxID, runtime.GOOS)
+	proxy, err := sshconf.ProxyCommand(sshconf.Invocation{Exe: self, GOOS: runtime.GOOS}, boxID)
 	if err != nil {
 		t.Fatal(err)
 	}

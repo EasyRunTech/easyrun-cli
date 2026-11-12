@@ -2,7 +2,8 @@
 // ~/.ssh/config (kontrak SSH box §6).
 //
 // Yang masuk ke perintah shell (ProxyCommand, Match exec) hanya: path program
-// ini (dikutip), kata tetap "tunnel"/"ssh-prepare", dan id box yang sudah
+// ini (dikutip), opsi --config-dir/--api-url dengan nilai yang dikutip dengan
+// aturan yang sama, kata tetap "tunnel"/"ssh-prepare", dan id box yang sudah
 // lolos validasi ketat. Nama/hostname dari server juga divalidasi sebelum
 // dipakai sebagai nilai opsi ssh.
 package sshconf
@@ -68,11 +69,19 @@ func ValidHostname(h string) error {
 
 // Params — semua yang dibutuhkan untuk menyusun argumen dan blok config.
 type Params struct {
-	Alias           string // nama di `Host` (blok config) — <box> yang diketik
-	ID              string // id box (principal sertifikat)
-	Hostname        string // HostName + HostKeyAlias
-	User            string // bawaan: User
-	Exe             string // path absolut program easyrun
+	Alias    string // nama di `Host` (blok config) — <box> yang diketik
+	ID       string // id box (principal sertifikat + HostKeyAlias)
+	Hostname string // HostName (tujuan ssh)
+	User     string // bawaan: User
+	Exe      string // path absolut program easyrun
+	// ConfigDir — folder konfigurasi easyrun (absolut) yang dibawa ke
+	// ProxyCommand / Match exec sebagai --config-dir: ssh, scp, dan VS Code
+	// tidak selalu mewarisi env shell (EASYRUN_CONFIG_DIR). "" = tidak dibawa.
+	ConfigDir string
+	// APIURL — alamat API yang dibawa sebagai --api-url; diisi hanya bila
+	// alamat itu datang dari env/opsi (yang dari config.json sudah ikut lewat
+	// ConfigDir). "" = tidak dibawa.
+	APIURL          string
 	IdentityFile    string
 	CertificateFile string
 	KnownHostsFile  string
@@ -115,7 +124,8 @@ func errUnquotable(path string) error {
 // "%" harfiah harus ditulis "%%".
 func escapePercent(s string) string { return strings.ReplaceAll(s, "%", "%%") }
 
-// QuoteExe — path program untuk dipakai di ProxyCommand / Match exec.
+// QuoteExe — path program (atau nilai argumen lain, mis. folder konfigurasi
+// dan alamat API) untuk dipakai di ProxyCommand / Match exec.
 //
 // Unix: ssh menjalankan perintah itu lewat $SHELL -c "exec …". Path yang
 // aman dibiarkan; selain itu dikutip tunggal — tetapi path berisi ', ", \
@@ -157,29 +167,46 @@ func quoteConfigPath(path, goos string) (string, error) {
 	return path, nil
 }
 
-// ProxyCommand — "<exe> tunnel <id>". Tanpa awalan exec: OpenSSH sudah
-// menambahkannya sendiri.
-func ProxyCommand(exe, id, goos string) (string, error) {
-	if err := ValidID(id); err != nil {
-		return "", err
-	}
-	q, err := QuoteExe(exe, goos)
-	if err != nil {
-		return "", err
-	}
-	return q + " tunnel " + id, nil
+// Invocation — cara ssh memanggil program ini (ProxyCommand / Match exec).
+type Invocation struct {
+	Exe       string
+	ConfigDir string // "" = tanpa --config-dir
+	APIURL    string // "" = tanpa --api-url
+	GOOS      string
 }
 
-// PrepareCommand — "<exe> ssh-prepare <id>" untuk Match exec.
-func PrepareCommand(exe, id, goos string) (string, error) {
+func (v Invocation) command(sub, id string) (string, error) {
 	if err := ValidID(id); err != nil {
 		return "", err
 	}
-	q, err := QuoteExe(exe, goos)
+	q, err := QuoteExe(v.Exe, v.GOOS)
 	if err != nil {
 		return "", err
 	}
-	return q + " ssh-prepare " + id, nil
+	parts := []string{q}
+	for _, o := range []struct{ flag, val string }{{"--config-dir", v.ConfigDir}, {"--api-url", v.APIURL}} {
+		if o.val == "" {
+			continue
+		}
+		qv, err := QuoteExe(o.val, v.GOOS)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, o.flag, qv)
+	}
+	return strings.Join(append(parts, sub, id), " "), nil
+}
+
+// ProxyCommand — "<exe> [--config-dir D] [--api-url U] tunnel <id>". Tanpa
+// awalan exec: OpenSSH sudah menambahkannya sendiri.
+func ProxyCommand(v Invocation, id string) (string, error) { return v.command("tunnel", id) }
+
+// PrepareCommand — "<exe> [--config-dir D] [--api-url U] ssh-prepare <id>"
+// untuk Match exec.
+func PrepareCommand(v Invocation, id string) (string, error) { return v.command("ssh-prepare", id) }
+
+func (p Params) invocation() Invocation {
+	return Invocation{Exe: p.Exe, ConfigDir: p.ConfigDir, APIURL: p.APIURL, GOOS: p.GOOS}
 }
 
 type option struct{ key, value string }
@@ -188,7 +215,7 @@ func (p Params) options() ([]option, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
-	proxy, err := ProxyCommand(p.Exe, p.ID, p.GOOS)
+	proxy, err := ProxyCommand(p.invocation(), p.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +237,11 @@ func (p Params) options() ([]option, error) {
 		{"CertificateFile", cert},
 		{"IdentitiesOnly", "yes"},
 		{"ProxyCommand", proxy},
-		{"HostKeyAlias", p.Hostname},
+		// Kunci host disimpan per id box, bukan per hostname: hostname bisa
+		// berpindah (ganti alamat) atau dipakai ulang box lain setelah box
+		// lama dihapus — keduanya tidak boleh memicu "host key changed".
+		// Sambungan memang selalu ke id ini (ProxyCommand tunnel <id>).
+		{"HostKeyAlias", p.ID},
 		{"UserKnownHostsFile", kh},
 		{"StrictHostKeyChecking", "accept-new"},
 		{"ServerAliveInterval", fmt.Sprint(ServerAliveInterval)},
@@ -252,7 +283,7 @@ func ConfigBlock(p Params) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	prep, err := PrepareCommand(p.Exe, p.ID, p.GOOS)
+	prep, err := PrepareCommand(p.invocation(), p.ID)
 	if err != nil {
 		return "", err
 	}

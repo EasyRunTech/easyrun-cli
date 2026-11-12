@@ -256,6 +256,9 @@ func (p *fakePanel) handleCert(w http.ResponseWriter, r *http.Request) {
 	if alias == "" {
 		alias = b.Hostname
 	}
+	// Jam server = jam palsu uji (panel sungguhan mengirim jamnya sendiri);
+	// CLI mengukur selisih jam laptop dari header ini.
+	w.Header().Set("Date", now.UTC().Format(http.TimeFormat))
 	ok(w, map[string]any{
 		"certificate": string(ssh.MarshalAuthorizedKey(cert)),
 		"expires_at":  now.Add(ttl).UTC().Format(time.RFC3339),
@@ -414,6 +417,13 @@ func newHarness(t *testing.T) *harness {
 		GOOS: "darwin",
 	}
 	return h
+}
+
+// invocation — awal ProxyCommand/Match exec yang ditulis CLI di harness ini:
+// program + --config-dir (selalu) + --api-url (karena alamat API uji datang
+// dari env EASYRUN_API_URL).
+func (h *harness) invocation() string {
+	return h.exe + " --config-dir " + h.d.Path + " --api-url " + h.p.srv.URL
 }
 
 func (h *harness) run(args ...string) int {

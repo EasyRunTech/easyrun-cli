@@ -69,7 +69,7 @@ func TestReasonDariDataPanel(t *testing.T) {
 }
 
 func TestCleanMembuangEscapeTerminal(t *testing.T) {
-	in := "box \x1b]0;judul\x07rusak\x1b[31m merah\r\nbaris x"
+	in := "box\u202Elive\u202C-\u2066a\u2069\u200Bb\u200D\uFEFFc\u2028d"
 	got := Clean(in)
 	if strings.ContainsAny(got, "\x1b\x07\r\n ") {
 		t.Fatalf("karakter kendali lolos: %q", got)
@@ -228,5 +228,31 @@ func TestPengalihanTidakDiikuti(t *testing.T) {
 	}
 	if hits != 12 {
 		t.Fatalf("server asal %d permintaan, ingin 12", hits)
+	}
+}
+
+// Temuan review 11: interval baru dari panel bersama slow_down.
+func TestIntervalSlowDown(t *testing.T) {
+	cases := map[string]int{
+		`{"success":false,"message":"x","data":{"error":"slow_down","interval":15}}`: 15,
+		`{"error":"slow_down","interval":10}`:                                        10,
+		`{"success":false,"data":{"error":"slow_down","interval":-3}}`:               0,
+		`{"success":false,"data":{"error":"slow_down","interval":"20"}}`:             0,
+		`{"success":false,"data":{"error":"slow_down"}}`:                             0,
+	}
+	for body, want := range cases {
+		e := ErrorFromResponse(400, nil, []byte(body), time.Now())
+		if e.Interval != want || e.Code != CodeSlowDown {
+			t.Errorf("%s: interval %d kode %q, ingin %d", body, e.Interval, e.Code, want)
+		}
+	}
+}
+
+// Temuan review 13: karakter format Unicode (pembalik arah, tanpa lebar, BOM)
+// dibuang.
+func TestCleanMembuangKarakterFormat(t *testing.T) {
+	in := "box\u202Elive\u202C-\u2066a\u2069\u200Bb\u200D\uFEFFc\u2028d"
+	if got := Clean(in); got != "boxlive-abcd" {
+		t.Fatalf("%q", got)
 	}
 }

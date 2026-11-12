@@ -52,7 +52,11 @@ func (a *App) cmdLogin(ctx context.Context, args []string) int {
 	if err != nil {
 		return a.fail("", err)
 	}
-	base, err := config.ResolveAPIURL(*apiFlag, a.Getenv, cfg)
+	flagURL := *apiFlag
+	if flagURL == "" {
+		flagURL = a.apiURLOpt
+	}
+	base, err := config.ResolveAPIURL(flagURL, a.Getenv, cfg)
 	if err != nil {
 		return a.fail("", err)
 	}
@@ -220,7 +224,14 @@ func (a *App) pollToken(ctx context.Context, c *api.Client, dc *api.DeviceCode) 
 			case api.CodeAuthorizationPending:
 				continue
 			case api.CodeSlowDown:
+				// RFC 8628 §3.5: tambah 5 dtk; bila panel menyebut interval
+				// barunya (data.interval), pakai yang itu bila lebih lama —
+				// hitungan panel bisa berbeda (percobaan ulang jaringan,
+				// batas atas) dan panel yang menegakkannya.
 				interval += slowDownStep
+				if s := time.Duration(ae.Interval) * time.Second; s > interval {
+					interval = s
+				}
 				continue
 			case api.CodeExpiredToken:
 				return nil, errDeviceExpired
@@ -334,15 +345,16 @@ func activationURL(raw string) string {
 }
 
 // openBrowser — tidak pernah menunggu dan tidak pernah membuat login gagal.
-func openBrowser(u string) error {
+// Sistem dan env diambil dari App (bisa diganti di uji).
+func (a *App) openBrowser(u string) error {
 	var cmd *exec.Cmd
-	switch runtime.GOOS {
+	switch a.GOOS {
 	case "darwin":
 		cmd = exec.Command("open", u)
 	case "windows":
 		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", u)
 	default:
-		if getenvAny("DISPLAY", "WAYLAND_DISPLAY") == "" {
+		if a.Getenv("DISPLAY") == "" && a.Getenv("WAYLAND_DISPLAY") == "" {
 			return errors.New("tidak ada tampilan grafis")
 		}
 		cmd = exec.Command("xdg-open", u)
