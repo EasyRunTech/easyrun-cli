@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,8 +45,19 @@ type ServerCommand struct {
 	Stderr io.Writer
 }
 
+// serverDrainGrace — setelah proses keluar, pembaca diberi waktu sekian untuk
+// menghabiskan ekor stdout sebelum pipa ditutup paksa (cucu yang mewarisi
+// stdout bisa menahan pipa tetap terbuka).
+const serverDrainGrace = 2 * time.Second
+
 // Start — nyalakan proses; Stop menutup stdin, menunggu sebentar, lalu
 // menghentikannya.
+//
+// Stdout memakai pipa milik sendiri (os.Pipe), bukan cmd.StdoutPipe: Wait
+// menutup StdoutPipe begitu proses keluar, padahal penjaga mungkin belum
+// membaca ekor keluarannya (dokumentasi os/exec: Wait tidak boleh dipanggil
+// sebelum semua pembacaan selesai) — ekor hilang dan pembaca mendapat
+// "file already closed".
 func (c ServerCommand) Start() (*Server, error) {
 	cmd := exec.Command(c.Argv[0], c.Argv[1:]...)
 	cmd.Dir = c.Dir
@@ -55,25 +67,58 @@ func (c ServerCommand) Start() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := cmd.StdoutPipe()
+	pr, pw, err := os.Pipe()
 	if err != nil {
+		_ = in.Close()
 		return nil, err
 	}
+	cmd.Stdout = pw
 	if err := cmd.Start(); err != nil {
+		_ = in.Close()
+		_ = pr.Close()
+		_ = pw.Close()
 		return nil, err
 	}
+	_ = pw.Close() // salinan milik anak tetap terbuka sampai ia keluar
+	out := &pipeReader{f: pr}
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
 		close(exited)
+		time.AfterFunc(serverDrainGrace, out.close)
 	}()
 	var once sync.Once
 	return &Server{In: in, Out: out, Stop: func() {
 		once.Do(func() {
 			_ = in.Close()
 			StopProcess(cmd.Process, exited, 2*time.Second)
+			out.close()
 		})
 	}}, nil
+}
+
+// pipeReader — ujung baca stdout server. Ditutup oleh kita sendiri (Stop,
+// atau habis masa tenggang setelah proses keluar) → pembaca menerima EOF,
+// bukan galat "file already closed".
+type pipeReader struct {
+	f      *os.File
+	once   sync.Once
+	closed atomic.Bool
+}
+
+func (p *pipeReader) Read(b []byte) (int, error) {
+	n, err := p.f.Read(b)
+	if err != nil && p.closed.Load() {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (p *pipeReader) close() {
+	p.once.Do(func() {
+		p.closed.Store(true)
+		_ = p.f.Close()
+	})
 }
 
 // StopProcess — tunggu proses keluar sendiri selama grace, lalu minta

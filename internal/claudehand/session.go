@@ -114,13 +114,30 @@ type session struct {
 // Serve — jalankan satu sambungan: kirim hello, lalu teruskan JSON-RPC dua
 // arah lewat penjaga sampai box/server menutup atau ctx selesai. Link TIDAK
 // ditutup (milik pemanggil); server dihentikan sebelum kembali.
+//
+// Hello (bisa ±240 KiB) ditulis di goroutine: saluran ssh yang belum terbuka
+// tidak membaca stdin, jadi tulisan itu bisa tertahan lama — Serve tetap
+// kembali begitu ctx selesai. Penulisan yang tertahan lepas saat pemanggil
+// menutup linkW (sesudah Serve kembali).
 func Serve(ctx context.Context, linkR io.Reader, linkW io.Writer, cfg Config) Result {
 	if cfg.Stats == nil {
 		cfg.Stats = &Stats{}
 	}
 	s := &session{cfg: cfg, linkW: linkW, srvEnd: make(chan struct{}), listIDs: map[string]bool{}}
-	if _, err := linkW.Write(cfg.Hello); err != nil {
-		return Result{LinkErr: err}
+	helloDone := make(chan error, 1)
+	go func() {
+		s.linkMu.Lock()
+		defer s.linkMu.Unlock()
+		_, err := linkW.Write(cfg.Hello)
+		helloDone <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return Result{}
+	case err := <-helloDone:
+		if err != nil {
+			return Result{LinkErr: err}
+		}
 	}
 	boxEnd := make(chan error, 1)
 	go func() { boxEnd <- s.fromBox(linkR) }()

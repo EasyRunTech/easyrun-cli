@@ -604,3 +604,88 @@ func TestSesiKarakterKontrolDinetralkan(t *testing.T) {
 		t.Errorf("setiap peristiwa audit harus satu baris:\n%s", raw)
 	}
 }
+
+// TestServerCommandEkorStdoutUtuh — server yang menulis lalu langsung keluar:
+// ekor keluarannya tetap terbaca utuh walau pembaca terlambat (dulu Wait
+// menutup StdoutPipe → ekor hilang + "file already closed").
+func TestServerCommandEkorStdoutUtuh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix")
+	}
+	sh := `i=0; while [ $i -lt 200 ]; do echo "{\"jsonrpc\":\"2.0\",\"method\":\"baris-$i\"}"; i=$((i+1)); done`
+	srv, err := ServerCommand{Argv: []string{"/bin/sh", "-c", sh}, Dir: t.TempDir()}.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	time.Sleep(500 * time.Millisecond) // proses sudah keluar dan di-Wait
+	raw, err := io.ReadAll(srv.Out)
+	if err != nil {
+		t.Fatalf("galat baca: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 200 || !strings.Contains(lines[199], "baris-199") {
+		t.Fatalf("ekor hilang: %d baris, terakhir %q", len(lines), lines[len(lines)-1])
+	}
+}
+
+// TestServerCommandCucuMenahanPipa — cucu yang mewarisi stdout tidak membuat
+// pembaca menunggu selamanya setelah server keluar; Stop juga melepasnya.
+func TestServerCommandCucuMenahanPipa(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix")
+	}
+	srv, err := ServerCommand{Argv: []string{"/bin/sh", "-c", "sleep 8 & echo hai"}, Dir: t.TempDir()}.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	got := make(chan error, 1)
+	var raw []byte
+	go func() {
+		var err error
+		raw, err = io.ReadAll(srv.Out)
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err != nil || strings.TrimSpace(string(raw)) != "hai" {
+			t.Errorf("baca: %q %v", raw, err)
+		}
+	case <-time.After(serverDrainGrace + 4*time.Second):
+		t.Fatal("pembaca tertahan cucu yang memegang stdout")
+	}
+}
+
+// TestSesiHelloTertahanTidakMenahanCtx — saluran yang belum membaca stdin
+// (hello besar tertahan) tidak boleh membuat Ctrl-C/UI keluar menunggu.
+func TestSesiHelloTertahanTidakMenahanCtx(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix")
+	}
+	f := newFixture(t)
+	p := f.policy(t, nil)
+	boxR, boxW := io.Pipe()
+	_, linkW := io.Pipe() // tidak pernah dibaca: Write tertahan
+	defer boxW.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Result, 1)
+	srv := newFakeServer()
+	go func() {
+		done <- Serve(ctx, boxR, linkW, Config{Policy: p, Hello: []byte(strings.Repeat("x", 200<<10) + "\n"), Start: srv.start})
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case res := <-done:
+		if res.Ready || res.LinkErr != nil {
+			t.Errorf("hasil: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve tertahan menulis hello setelah ctx dibatalkan")
+	}
+	_ = linkW.Close() // pemanggil menutup link → goroutine hello lepas
+	if srv.starts != 0 {
+		t.Error("server tidak boleh dinyalakan")
+	}
+}
