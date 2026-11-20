@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,7 +74,9 @@ const claudeMore = `
       herdr = tangan dilepas, sambungan ditutup, ringkasan dicetak.
   easyrun claude <box> [<sesi>:]<pane> hand [--read-only] [--allow-home]
       tangan saja (setiap aksi dicetak di sini) — untuk yang melihat pane
-      lewat Konsol di browser. Ctrl-C = lepas.
+      lewat Konsol di browser. Ctrl-C = lepas. Putus = disambung ulang
+      otomatis (sertifikat diperbarui bila perlu), kecuali pane sudah
+      dipegang tangan lain atau autentikasi SSH ditolak berulang.
   easyrun claude <box> <pane> stop
       hentikan claude di pane itu
 
@@ -624,6 +627,14 @@ func (a *App) claudeHands(ctx context.Context, conn *boxConn, d config.Dir, ca c
 	h := &handLoop{
 		a: a, conn: conn, ca: ca, local: local, stats: stats, audit: audit,
 		ready: make(chan struct{}), d: d, restartMux: ca.action == "hand",
+		// Sertifikat bawaan berumur 1 jam: master yang dibuka ulang (mode
+		// hand) butuh sertifikat segar. ensureCert hanya menghubungi panel
+		// bila sisa < 5 menit; kredensial dibaca ulang (login di terminal
+		// lain ikut terpakai).
+		renewCert: func(ctx context.Context) error {
+			_, err := a.ensureCert(ctx, d, func() (*api.Client, error) { return a.session(d) }, b.ID)
+			return err
+		},
 	}
 	if ca.action == "hand" {
 		// Lapis kedua: teks asal box sudah dinetralkan claudehand, tetapi
@@ -667,7 +678,15 @@ func (a *App) claudeHands(ctx context.Context, conn *boxConn, d config.Dir, ca c
 	stopHand()
 	<-loopDone
 	audit.Log("selesai", fmt.Sprintf("panggilan=%d ditolak=%d", stats.Calls(), stats.Denied()))
-	a.claudeSummary(stats, h.notes(), auditPath)
+	notes := h.notes()
+	if !h.wasReady() {
+		// attach: selama UI terbuka galat tangan tidak tampil di layar; tanpa
+		// ini ringkasan hanya "0 panggilan tool" tanpa alasan.
+		if last := h.lastTrouble(); last != "" {
+			notes = append(notes, "tangan laptop tidak pernah tersambung; galat terakhir: "+last)
+		}
+	}
+	a.claudeSummary(stats, notes, auditPath)
 	return code
 }
 
@@ -722,6 +741,18 @@ func (a *App) claudeSummary(stats *claudehand.Stats, notes []string, auditPath s
 
 // ---------- putaran tangan ----------
 
+const (
+	// handAuthFailMax — master yang dibuka ulang ditolak autentikasinya
+	// sekian kali berturut-turut (walau sertifikat sudah diperbarui) →
+	// tangan berhenti, bukan mencoba tanpa akhir.
+	handAuthFailMax = 3
+	// selfLearnTries/selfLearnPause — `easybox ls` sesudah jabat tangan untuk
+	// mencatat connected_at sambungan ini (jembatan menulis keadaannya tepat
+	// sesudah jabat tangan, jadi bisa sedikit tertinggal).
+	selfLearnTries = 3
+	selfLearnPause = 300 * time.Millisecond
+)
+
 type handLoop struct {
 	a          *App
 	conn       *boxConn
@@ -734,9 +765,15 @@ type handLoop struct {
 	ready      chan struct{}
 	readyOnce  sync.Once
 	restartMux bool
+	renewCert  func(context.Context) error // nil = tidak diperbarui (uji)
 
-	mu    sync.Mutex
-	noted []string
+	// Hanya disentuh goroutine putaran (run → once).
+	me     easyboxLaptop // identitas tangan ini di `easybox ls` (dari hello)
+	selfAt *string       // connected_at sambungan terakhir tangan ini; nil = tidak diketahui
+
+	mu      sync.Mutex
+	noted   []string
+	trouble string // galat terakhir (ringkasan bila tidak pernah tersambung)
 }
 
 func (h *handLoop) note(msg string) {
@@ -758,6 +795,34 @@ func (h *handLoop) notes() []string {
 	return append([]string(nil), h.noted...)
 }
 
+// fail — catat galat terakhir dan tampilkan (mode hand).
+func (h *handLoop) fail(msg string) {
+	h.setTrouble(msg)
+	h.say("! " + msg)
+}
+
+func (h *handLoop) setTrouble(msg string) {
+	h.mu.Lock()
+	h.trouble = msg
+	h.mu.Unlock()
+}
+
+func (h *handLoop) lastTrouble() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.trouble
+}
+
+// wasReady — jabat tangan pernah selesai di jalan ini.
+func (h *handLoop) wasReady() bool {
+	select {
+	case <-h.ready:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *handLoop) say(msg string) {
 	if h.log != nil {
 		h.log(msg)
@@ -766,18 +831,29 @@ func (h *handLoop) say(msg string) {
 
 func (h *handLoop) hello() ([]byte, error) {
 	host, _ := h.a.Hostname()
-	return claudehand.BuildHello(h.local.policy, claudehand.HelloInfo{
+	hi := claudehand.BuildHello(h.local.policy, claudehand.HelloInfo{
 		Host: host, User: claudehand.LocalUser(h.a.Getenv), OS: claudehand.OSString(),
 		ClaudeVersion: h.local.version, Guard: "easyrun-cli/" + version.Version,
-	}).Line()
+	})
+	// Jembatan menyalin host/user/root/mode hello apa adanya ke `easybox ls`.
+	h.me = easyboxLaptop{Host: hi.Host, User: hi.User, Root: hi.Root, Mode: hi.Mode}
+	return hi.Line()
 }
 
 // run — sambung, layani, sambung ulang dengan jeda bertambah (1 dtk … 30
 // dtk) selama ctx hidup. Berhenti tanpa sambung ulang bila digantikan laptop
-// lain atau box menolak argumen.
+// lain, pane sudah dipegang tangan lain, box menolak argumen, atau
+// autentikasi SSH ditolak berulang.
 func (h *handLoop) run(ctx context.Context) {
 	backoff := time.Second
 	missing := false
+	authFails := 0
+	pause := func() bool {
+		h.say(fmt.Sprintf("menyambung ulang dalam %s…", backoff))
+		ok := sleepOrDone(ctx, backoff)
+		backoff = min(backoff*2, handBackoffMax)
+		return ok
+	}
 	for ctx.Err() == nil {
 		if !h.conn.mux.alive() {
 			if !h.restartMux {
@@ -785,17 +861,47 @@ func (h *handLoop) run(ctx context.Context) {
 				return
 			}
 			h.say("sambungan SSH terputus; membuka ulang…")
-			m, err := h.a.startMux(ctx, h.conn, h.d)
+			m, err := h.reopen(ctx)
+			if ctx.Err() != nil {
+				return
+			}
 			if err != nil {
-				h.say("! " + explain(err))
-				if !sleepOrDone(ctx, backoff) {
+				h.fail(err.Error())
+				if !authFailure(err) {
+					authFails = 0
+				} else if authFails++; authFails >= handAuthFailMax {
+					h.note(fmt.Sprintf("autentikasi SSH ke box gagal %d kali berturut-turut (sertifikat sudah diperiksa/diperbarui); tangan berhenti — bila perlu `easyrun login`, lalu ulangi: easyrun claude %s %s %s. Galat terakhir: %s",
+						authFails, h.ca.box, h.ca.target(), h.ca.action, claudehand.Short(err.Error(), 300)))
 					return
 				}
-				backoff = min(backoff*2, handBackoffMax)
+				if !pause() {
+					return
+				}
 				continue
 			}
+			authFails = 0
 			h.conn.mux.close(h.conn)
 			h.conn.mux = m
+		}
+		// Sambung ulang setelah pernah tersambung: pemberitahuan "digantikan"
+		// bisa hilang (laptop tidur, jaringan putus) — jangan merebut kembali
+		// pane yang kini dipegang tangan lain.
+		if h.wasReady() {
+			who, err := h.otherHolder(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				h.fail("memeriksa pemegang pane: " + explain(err))
+				if !pause() {
+					return
+				}
+				continue
+			}
+			if who != "" {
+				h.note(fmt.Sprintf("pane %s sekarang dipegang %s; tangan ini berhenti supaya tidak merebutnya kembali (ulangi perintah ini bila memang ingin mengambil alih)", h.ca.target(), who))
+				return
+			}
 		}
 		start := h.a.Now()
 		res, code, err := h.once(ctx)
@@ -804,7 +910,7 @@ func (h *handLoop) run(ctx context.Context) {
 		}
 		switch {
 		case err != nil:
-			h.say("! " + err.Error())
+			h.fail(err.Error())
 		case res.Replaced:
 			h.note(fmt.Sprintf("pane %s diambil alih laptop lain (tangan terbaru menang); tangan ini berhenti", h.ca.target()))
 			return
@@ -812,6 +918,7 @@ func (h *handLoop) run(ctx context.Context) {
 			h.note("box menolak argumen easybox-hand-connect (versi box/easyrun tidak cocok?)")
 			return
 		case code == 3:
+			h.setTrouble(fmt.Sprintf("belum ada claude yang berjalan di pane %s", h.ca.pane))
 			if !missing {
 				h.say(fmt.Sprintf("belum ada claude yang berjalan di pane %s; menunggu…", h.ca.pane))
 			}
@@ -819,21 +926,123 @@ func (h *handLoop) run(ctx context.Context) {
 		case res.ServerErr != nil:
 			h.note("claude mcp serve lokal berhenti: " + res.ServerErr.Error())
 		case res.LinkErr != nil:
-			h.say("! sambungan tangan: " + res.LinkErr.Error())
-		default:
-			if res.Ready {
-				h.say("tangan terputus dari box")
-			}
+			h.fail("sambungan tangan: " + res.LinkErr.Error())
+		case res.Ready:
+			h.say("tangan terputus dari box")
+		case code != 255: // 255: once sudah mencatat pesan ssh
+			h.setTrouble(fmt.Sprintf("box menutup sambungan tangan sebelum jabat tangan selesai (kode %d; lihat log jembatan di box)", code))
 		}
 		if res.Ready || h.a.Now().Sub(start) >= handStableAfter {
 			backoff = time.Second
 			missing = false
 		}
-		h.say(fmt.Sprintf("menyambung ulang dalam %s…", backoff))
-		if !sleepOrDone(ctx, backoff) {
+		if !pause() {
 			return
 		}
-		backoff = min(backoff*2, handBackoffMax)
+	}
+}
+
+// reopen — perbarui sertifikat dulu, baru buka master baru: master dengan
+// sertifikat kedaluwarsa ditolak "Permission denied" berulang tanpa akhir.
+func (h *handLoop) reopen(ctx context.Context) (*sshMux, error) {
+	if h.renewCert != nil {
+		if err := h.renewCert(ctx); err != nil {
+			return nil, &certError{err: err}
+		}
+	}
+	return h.a.startMux(ctx, h.conn, h.d)
+}
+
+// certError — sertifikat SSH tidak bisa diperbarui.
+type certError struct{ err error }
+
+func (e *certError) Error() string { return "memperbarui sertifikat SSH: " + explain(e.err) }
+func (e *certError) Unwrap() error { return e.err }
+
+// authFailure — galat yang tidak sembuh dengan mencoba lagi: sshd menolak
+// autentikasi, atau sertifikat tidak bisa diminta karena sesi CLI / akses ke
+// box tidak berlaku.
+func authFailure(err error) bool {
+	var me *muxError
+	if errors.As(err, &me) {
+		return me.auth
+	}
+	var ce *certError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	var ee *expiredError
+	var ae *api.Error
+	switch {
+	case errors.Is(err, config.ErrNotLoggedIn), errors.As(err, &ee):
+		return true
+	case errors.As(err, &ae):
+		return ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound
+	}
+	return false
+}
+
+// paneLaptop — laptop yang memegang pane ini menurut `easybox ls` (nil =
+// tidak ada).
+func (h *handLoop) paneLaptop(ctx context.Context) (*easyboxLaptop, error) {
+	panes, err := h.a.easyboxLs(ctx, h.conn)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range panes {
+		if p.Pane == h.ca.pane {
+			return p.Laptop, nil
+		}
+	}
+	return nil, nil
+}
+
+func (h *handLoop) sameLaptop(l *easyboxLaptop) bool {
+	return l.Host == h.me.Host && l.User == h.me.User && l.Root == h.me.Root && l.Mode == h.me.Mode
+}
+
+// otherHolder — "" bila pane bebas, atau masih tercatat atas sambungan tangan
+// ini sendiri (jembatan belum sadar sambungan lamanya putus); selain itu
+// keterangan pemegang lain. Identitas = host/user/root/mode hello tangan ini
+// + connected_at sambungan terakhirnya (dicatat learnSelf): laptop & folder
+// yang sama dari proses easyrun lain tetap terhitung "lain".
+func (h *handLoop) otherHolder(ctx context.Context) (string, error) {
+	l, err := h.paneLaptop(ctx)
+	if err != nil || l == nil {
+		return "", err
+	}
+	same := h.sameLaptop(l)
+	if same && (h.selfAt == nil || l.ConnectedAt == *h.selfAt) {
+		return "", nil
+	}
+	who := dash(l.Host)
+	if l.User != "" {
+		who = dash(l.User) + "@" + who
+	}
+	if same {
+		who += " (laptop & folder ini, dari proses easyrun lain)"
+	}
+	return fmt.Sprintf("%s, root %s, sejak %s", who, dash(l.Root), dash(l.ConnectedAt)), nil
+}
+
+// learnSelf — catat connected_at sambungan ini dari `easybox ls` (lewat
+// master yang sama) sesudah jabat tangan. Gagal → tidak diketahui, dan
+// otherHolder membandingkan host/user/root/mode saja.
+func (h *handLoop) learnSelf(ctx context.Context, ended <-chan struct{}) {
+	h.selfAt = nil
+	for i := 0; i < selfLearnTries; i++ {
+		if l, err := h.paneLaptop(ctx); err == nil && l != nil && h.sameLaptop(l) {
+			at := l.ConnectedAt
+			h.selfAt = &at
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ended:
+			return
+		case <-time.After(selfLearnPause):
+		}
 	}
 }
 
@@ -886,23 +1095,40 @@ func (h *handLoop) once(ctx context.Context) (claudehand.Result, int, error) {
 		Dir:  h.local.policy.Root,
 		Env:  claudehand.ServerEnv(h.conn.env, h.local.handCfg),
 	}
-	res := claudehand.Serve(ctx, pr, stdin, claudehand.Config{
-		Policy: h.local.policy, Hello: hello, Start: srvCmd.Start,
-		Stats: h.stats, Audit: h.audit, Log: h.log,
-		OnReady: func() {
-			h.audit.Log("tersambung", "pane="+h.ca.target())
-			h.say(fmt.Sprintf("tersambung ke %s — root %s (mode %s)", h.ca.target(), h.local.policy.Root, h.local.policy.Mode()))
-			h.readyOnce.Do(func() { close(h.ready) })
-		},
-	})
+	ready := make(chan struct{})
+	served := make(chan struct{})
+	var res claudehand.Result
+	go func() {
+		defer close(served)
+		res = claudehand.Serve(ctx, pr, stdin, claudehand.Config{
+			Policy: h.local.policy, Hello: hello, Start: srvCmd.Start,
+			Stats: h.stats, Audit: h.audit, Log: h.log,
+			OnReady: func() {
+				h.audit.Log("tersambung", "pane="+h.ca.target())
+				h.say(fmt.Sprintf("tersambung ke %s — root %s (mode %s)", h.ca.target(), h.local.policy.Root, h.local.policy.Mode()))
+				h.readyOnce.Do(func() { close(h.ready) })
+				close(ready)
+			},
+		})
+	}()
+	select {
+	case <-served:
+	case <-ready:
+		// Di goroutine putaran (bukan di OnReady): master tidak pernah
+		// diganti selagi `easybox ls` ini memakainya.
+		h.learnSelf(ctx, served)
+		<-served
+	}
 	_ = stdin.Close()
 	claudehand.StopProcess(cmd.Process, exited, 3*time.Second)
 	code := cmd.ProcessState.ExitCode()
 	h.audit.Log("lepas", fmt.Sprintf("pane=%s kode=%d", h.ca.target(), code))
 	if code == 255 {
-		if msg := strings.TrimSpace(api.Clean(errb.String())); msg != "" {
-			h.say("! ssh: " + msg)
+		msg := strings.TrimSpace(api.Clean(errb.String()))
+		if msg == "" {
+			msg = "berhenti (kode 255) tanpa keterangan"
 		}
+		h.fail("ssh: " + msg)
 	}
 	return res, code, nil
 }

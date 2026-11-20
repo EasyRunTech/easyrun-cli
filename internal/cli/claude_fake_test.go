@@ -12,12 +12,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 const envFake = "EASYRUN_CLI_TEST_FAKE"
@@ -34,8 +37,37 @@ func fakeMain() (int, bool) {
 		return fakeClaude(os.Args[1:]), true
 	case "easybox-hand-connect":
 		return fakeHandConnect(os.Args[1:]), true
+	case "pdeath-parent":
+		return fakePdeathParent(os.Args[1:]), true
 	}
 	return 0, false
+}
+
+// fakePdeathParent — induk uji Pdeathsig: jalankan master palsu dengan
+// masterProcAttr() (seperti startMux), cetak pid-nya, lalu mati mendadak
+// (SIGKILL: tanpa pembersihan apa pun).
+func fakePdeathParent(args []string) int {
+	if len(args) != 2 {
+		return 2
+	}
+	cmd := exec.Command(args[0], "-o", "ControlMaster=yes", "-o", "ControlPath="+args[1], "-N", "uji")
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = masterProcAttr()
+	if err := cmd.Start(); err != nil {
+		return 1
+	}
+	for i := 0; i < 200; i++ {
+		if _, err := os.Lstat(args[1]); err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	fmt.Println(cmd.Process.Pid)
+	if p, err := os.FindProcess(os.Getpid()); err == nil {
+		_ = p.Kill()
+	}
+	time.Sleep(time.Minute)
+	return 1
 }
 
 type sshCall struct {
@@ -112,7 +144,7 @@ func fakeSSH(args []string) int {
 		}
 		return 255
 	case c.Opts["ControlMaster"] == "yes":
-		return fakeMaster(cp)
+		return fakeMaster(cp, c.Opts["CertificateFile"])
 	}
 	if c.Opts["ControlMaster"] == "no" && cp != "" && !muxDial(cp, "check") {
 		// ssh sungguhan akan menyambung langsung (sesi SSH kedua); uji ini
@@ -123,18 +155,63 @@ func fakeSSH(args []string) int {
 	return fakeBox(c.Remote)
 }
 
-func fakeMaster(path string) int {
-	if msg := os.Getenv("FAKE_MASTER_FAIL"); msg != "" {
+// fakeCount — penghitung lintas proses palsu (berkas di FAKE_DIR, satu
+// byte per kejadian); mengembalikan urutan kejadian ini (mulai 1).
+func fakeCount(name string) int {
+	p := filepath.Join(os.Getenv("FAKE_DIR"), name)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return 0
+	}
+	_, _ = f.Write([]byte{'.'})
+	_ = f.Close()
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return int(fi.Size())
+}
+
+// certValidBefore — ValidBefore sertifikat yang dipakai master (0 = tidak
+// terbaca): membuktikan master baru memakai sertifikat yang diperbarui.
+func certValidBefore(path string) uint64 {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(raw)
+	if err != nil {
+		return 0
+	}
+	if c, ok := pub.(*ssh.Certificate); ok {
+		return c.ValidBefore
+	}
+	return 0
+}
+
+type masterLog struct {
+	N           int    `json:"n"`
+	PID         int    `json:"pid"`
+	Path        string `json:"path"`
+	ValidBefore uint64 `json:"valid_before"`
+}
+
+func fakeMaster(path, certFile string) int {
+	n := fakeCount("masters")
+	fakeLog("master.log", masterLog{N: n, PID: os.Getpid(), Path: path, ValidBefore: certValidBefore(certFile)})
+	if msg := os.Getenv("FAKE_MASTER_FAIL"); msg != "" && n >= envInt("FAKE_MASTER_FAIL_FROM", 1) {
 		fmt.Fprintln(os.Stderr, msg)
 		return 255
 	}
+	// Sinyal didaftarkan sebelum soket ada: SIGTERM kapan pun soket sudah
+	// terlihat selalu berakhir dengan soket dihapus.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
 	l, err := net.Listen("unix", path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "palsu: listen:", err)
 		return 255
 	}
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
 	done := make(chan int, 1)
 	go func() {
 		<-sig
@@ -196,6 +273,11 @@ func fakeBox(remote []string) int {
 			fmt.Printf(`{"session":%q,"pane":%q,"state":"started"}`+"\n", remote[2], remote[3])
 			return 0
 		case "ls":
+			if b, err := os.ReadFile(os.Getenv("FAKE_LS_FILE")); err == nil {
+				fmt.Println(strings.TrimSpace(string(b)))
+				fakeCount("ls-done") // uji tahu isi berkas sudah terbaca
+				return 0
+			}
 			v := os.Getenv("FAKE_LS_JSON")
 			if v == "" {
 				v = `{"panes":[]}`
@@ -237,6 +319,10 @@ func envIntStr(s string) int {
 func fakeHandConnect(args []string) int {
 	if len(args) != 3 || args[1] != "--wait" {
 		return 2
+	}
+	if code := envInt("FAKE_HC_EXIT", 0); code != 0 {
+		fmt.Fprintln(os.Stderr, os.Getenv("FAKE_HC_STDERR"))
+		return code
 	}
 	wait, _ := strconv.Atoi(args[2])
 	sock := filepath.Join(os.Getenv("FAKE_EB"), "hands", args[0]+".sock")

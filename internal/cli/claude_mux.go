@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -64,19 +65,23 @@ func controlPath(d config.Dir) (string, error) {
 	return "", fmt.Errorf("tidak ada folder pendek untuk soket ssh (alamat soket unix ≤ %d byte); pakai --config-dir dengan path lebih pendek", sunPathMax-1)
 }
 
+// controlAlphabet — huruf nama soket acak (tanpa l/o/0/1).
+const controlAlphabet = "abcdefghijkmnpqrstuvwxyz23456789"
+
 func randomName(n int) string {
-	const alphabet = "abcdefghijkmnpqrstuvwxyz23456789"
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	for i := range b {
-		b[i] = alphabet[int(b[i])%len(alphabet)]
+		b[i] = controlAlphabet[int(b[i])%len(controlAlphabet)]
 	}
 	return string(b)
 }
 
 // startMux — jalankan master (`-N`, BatchMode) dan tunggu sampai soketnya
-// menjawab `-O check`. Master adalah proses anak: ditutup `close`.
+// menjawab `-O check`. Master adalah proses anak: ditutup `close`. Master
+// yatim jalan sebelumnya dibersihkan dulu (reapMasters).
 func (a *App) startMux(ctx context.Context, c *boxConn, d config.Dir) (*sshMux, error) {
+	a.reapMasters(c, d)
 	path, err := controlPath(d)
 	if err != nil {
 		return nil, err
@@ -85,18 +90,28 @@ func (a *App) startMux(ctx context.Context, c *boxConn, d config.Dir) (*sshMux, 
 	if err != nil {
 		return nil, err
 	}
+	// Pemilik dicatat SEBELUM soket ada: easyrun lain yang sedang
+	// membersihkan tidak pernah melihat soket hidup tanpa pemilik.
+	pidPath := path + controlPidSuffix
+	if err := writeMuxOwner(pidPath, muxOwner{Owner: os.Getpid()}); err != nil {
+		return nil, err
+	}
 	m := &sshMux{path: path, quoted: q, exited: make(chan struct{}), stderr: &tailBuffer{max: muxStderrLimit}}
 	argv := append(append([]string(nil), c.base...),
 		"-o", "ControlMaster=yes", "-o", "ControlPath="+q, "-o", "ControlPersist=no",
 		"-o", "BatchMode=yes", "-N", "-T", c.host)
 	m.cmd = exec.Command(c.sshPath, argv[1:]...)
 	m.cmd.Env = c.env
+	// Linux: master ikut berhenti (SIGTERM) bila easyrun mati mendadak.
+	m.cmd.SysProcAttr = masterProcAttr()
 	// stderr master (termasuk pesan `easyrun tunnel`) disimpan, bukan ke
 	// layar: selama attach layar milik UI.
 	m.cmd.Stderr = m.stderr
 	if err := m.cmd.Start(); err != nil {
+		_ = os.Remove(pidPath)
 		return nil, fmt.Errorf("menjalankan ssh: %w", err)
 	}
+	_ = writeMuxOwner(pidPath, muxOwner{Owner: os.Getpid(), Master: m.cmd.Process.Pid})
 	go func() {
 		_ = m.cmd.Wait()
 		close(m.exited)
@@ -105,7 +120,9 @@ func (a *App) startMux(ctx context.Context, c *boxConn, d config.Dir) (*sshMux, 
 	for {
 		select {
 		case <-m.exited:
-			return nil, m.failure()
+			err := m.failure()
+			m.close(c)
+			return nil, err
 		case <-ctx.Done():
 			m.close(c)
 			return nil, ctx.Err()
@@ -135,9 +152,23 @@ func (m *sshMux) detail() string {
 	return ""
 }
 
+// muxError — master gagal dibuka.
+type muxError struct {
+	msg string
+	// auth — sshd box menolak autentikasi ("Permission denied"), mis.
+	// sertifikat kedaluwarsa atau akses dicabut: mengulang dengan bahan yang
+	// sama tidak akan berhasil.
+	auth bool
+}
+
+func (e *muxError) Error() string { return e.msg }
+
 func (m *sshMux) failure() error {
 	code := m.cmd.ProcessState.ExitCode()
-	return fmt.Errorf("ssh berhenti (kode %d) sebelum sambungan siap%s", code, m.detail())
+	return &muxError{
+		msg:  fmt.Sprintf("ssh berhenti (kode %d) sebelum sambungan siap%s", code, m.detail()),
+		auth: strings.Contains(m.stderr.String(), "Permission denied"),
+	}
 }
 
 // control — `ssh -O <op>` ke master ini.
@@ -175,4 +206,117 @@ func (m *sshMux) close(c *boxConn) {
 	}
 	claudehand.StopProcess(m.cmd.Process, m.exited, 3*time.Second)
 	_ = os.Remove(m.path)
+	_ = os.Remove(m.path + controlPidSuffix)
+}
+
+// ---------- master yatim ----------
+
+const (
+	// controlPidSuffix — "<soket>.pid": pemilik master (pid easyrun) dan pid
+	// master, supaya jalan berikutnya bisa membersihkan master yatim.
+	controlPidSuffix = ".pid"
+	reapControlLimit = 5 * time.Second
+	reapExitWait     = 3 * time.Second
+)
+
+// muxOwner — isi <soket>.pid.
+type muxOwner struct {
+	Owner  int `json:"owner"`  // pid easyrun yang membuka master
+	Master int `json:"master"` // pid ssh master (0 = belum dijalankan)
+}
+
+func writeMuxOwner(path string, o muxOwner) error {
+	b, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	return config.WriteFileAtomic(path, append(b, '\n'), 0o600)
+}
+
+// controlNameOK — nama soket buatan controlPath (randomName), bukan berkas
+// lain (termasuk soket sementara "<nama>.<16 acak>" milik ssh yang sedang
+// dibuat, dan berkas sementara WriteFileAtomic).
+func controlNameOK(name string) bool {
+	if len(name) != controlNameLen {
+		return false
+	}
+	for _, r := range name {
+		if !strings.ContainsRune(controlAlphabet, r) {
+			return false
+		}
+	}
+	return true
+}
+
+// reapMasters — bersihkan master yatim sebelum membuka master baru. Master
+// `-N ControlPersist=no` tidak tahu easyrun-nya mati mendadak (SIGKILL,
+// panic, laptop dimatikan paksa): ia tetap memegang satu dari 4 sesi SSH box
+// dan soketnya tertinggal. Hanya folder soket easyrun milik pengguna ini
+// (0700, bukan symlink) dan hanya nama buatan controlPath yang disentuh:
+//
+//   - <nama>.pid dengan pemilik yang masih hidup → dibiarkan (jalan lain);
+//   - pemilik sudah mati → `ssh -O exit` lewat soketnya; bila master masih
+//     hidup (mis. soketnya terhapus) dan argv-nya memuat path soket itu →
+//     SIGTERM; lalu soket mati & pidfile dihapus;
+//   - soket tanpa pidfile (easyrun versi lama) → dihapus hanya bila mati
+//     (sambungan ditolak); yang masih menjawab dibiarkan.
+func (a *App) reapMasters(c *boxConn, d config.Dir) {
+	for _, dir := range controlDirs(d) {
+		if !privateDirOK(dir) {
+			continue
+		}
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		owned := map[string]bool{}
+		for _, e := range ents {
+			if base, ok := strings.CutSuffix(e.Name(), controlPidSuffix); ok && controlNameOK(base) {
+				owned[base] = true
+				a.reapOwned(c, dir, base)
+			}
+		}
+		for _, e := range ents {
+			if name := e.Name(); controlNameOK(name) && !owned[name] {
+				if p := filepath.Join(dir, name); ownedSocket(p) && socketDead(p) {
+					_ = os.Remove(p)
+				}
+			}
+		}
+	}
+}
+
+func (a *App) reapOwned(c *boxConn, dir, base string) {
+	pidPath := filepath.Join(dir, base+controlPidSuffix)
+	sock := filepath.Join(dir, base)
+	if !ownedRegular(pidPath) {
+		return
+	}
+	raw, err := os.ReadFile(pidPath)
+	var o muxOwner
+	if err != nil || json.Unmarshal(raw, &o) != nil || o.Owner <= 0 {
+		return // ragu (mis. sedang ditulis) → biarkan
+	}
+	if o.Owner == os.Getpid() || processAlive(o.Owner) {
+		return
+	}
+	q, qerr := sshconf.QuoteConfigPath(sock, a.GOOS)
+	sent := false
+	if ownedSocket(sock) && qerr == nil {
+		sent = (&sshMux{path: sock, quoted: q}).control(c, "exit", reapControlLimit)
+	}
+	if o.Master > 0 {
+		for end := time.Now().Add(reapExitWait); sent && processAlive(o.Master) && time.Now().Before(end); {
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Master masih hidup (soketnya terhapus, atau tidak menjawab): hanya
+		// dihentikan bila argv-nya memuat path soket acak ini.
+		if processAlive(o.Master) && processArgsContain(o.Master, sock, q) {
+			_ = terminatePID(o.Master)
+		}
+	}
+	if ownedSocket(sock) && socketDead(sock) {
+		_ = os.Remove(sock)
+	}
+	_ = os.Remove(pidPath)
 }

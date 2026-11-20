@@ -117,9 +117,11 @@ easyrun claude contoh-box w1 stop        # hentikan claude di pane itu
 | Aksi | Yang terjadi |
 |---|---|
 | `attach [--read-only] [--allow-home]` | Periksa laptop (root sah, `claude` ada dan `claude mcp serve` jalan, ada terminal) → satu sambungan ssh master (ControlMaster) → `easybox version` (protokol 1, claude terpasang & login) → `easybox ensure <sesi> <pane>` → tangan berjalan di latar lewat `easybox-hand-connect <pane> --wait 60`, disambung ulang otomatis (jeda 1–30 dtk) selama UI hidup → UI `ssh -t … easybox attach-ui <sesi> <pane>`. Saat UI keluar: tangan dilepas, master ditutup, ringkasan dicetak (jumlah panggilan, yang ditolak, path log audit). |
-| `hand [--read-only] [--allow-home]` | Sama tanpa UI; setiap aksi dicetak di terminal. |
+| `hand [--read-only] [--allow-home]` | Sama tanpa UI; setiap aksi dicetak di terminal. Bila master ssh putus, sertifikat diperbarui dulu (bawaan berumur 1 jam) lalu master dibuka ulang; ditolak autentikasi 3× berturut-turut → berhenti dengan catatan (`easyrun login`). |
 | `ls` | `easybox ls`, satu sambungan ssh biasa. |
 | `stop` | `easybox stop <pane>`. |
+
+`<sesi>` dan `<pane>`: diawali huruf/angka, sisanya huruf/angka/`._-`, maks 40 karakter (`-h`, `.`, `..`, `.x` ditolak). Sambung ulang tangan (keduanya): setelah pernah tersambung, `easybox ls` diperiksa dulu — bila pane kini dipegang tangan lain (laptop lain, atau laptop & folder yang sama dari proses easyrun lain; dibedakan lewat host/user/root/mode hello + `connected_at` sambungan ini), tangan berhenti dan tidak merebutnya kembali walau pemberitahuan "digantikan" hilang (laptop tidur, jaringan putus). Bila tangan tidak pernah tersambung, ringkasan akhir menyebut galat terakhirnya.
 
 Penjaga laptop (laptop tidak percaya box):
 
@@ -131,6 +133,7 @@ Penjaga laptop (laptop tidak percaya box):
 - Permintaan dari `claude mcp serve` ke klien dijawab "tidak didukung" di laptop; hanya `notifications/tools/list_changed` yang diteruskan ke box.
 - `claude mcp serve` dijalankan dengan cwd = root, `CLAUDE_CONFIG_DIR` terpisah, tanpa `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_AUTH_TOKEN`. Perintah itu tidak terdokumentasi resmi; bila tool yang diharapkan hilang atau skemanya berubah, easyrun memperingatkan (panggilan yang tidak cocok ditolak, bukan diloloskan).
 - `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md` di root (≤ 20.000 karakter) dikirim ke box sebagai instruksi proyek, lewat pemeriksaan path yang sama.
+- Teks dari box (perintah Bash, path, nama tool) yang dicetak ke terminal atau ditulis ke log audit dinetralkan: karakter kontrol C0/C1, DEL, pemisah baris Unicode, dan penanda arah teks (bidi) tampil sebagai escape (`\x1b`, `\r`, `\u202e`), jadi box tidak bisa menyamarkan aksinya dengan escape ANSI/OSC. Teks Unicode biasa tidak diubah.
 
 Butuh: Claude Code di laptop (tidak perlu login) dan di box (sudah login: `easyrun ssh <box>` lalu `claude`), box versi terbaru (perintah `easybox`). Belum didukung di Windows (OpenSSH Windows tidak punya ControlMaster); `ls` dan `stop` tetap jalan.
 
@@ -148,7 +151,7 @@ Semua di `~/.easyrun/` (folder 0700):
 | `clock.json` | selisih jam laptop dengan server (dari header `Date`), supaya umur sertifikat dinilai dengan jam server | 0600 |
 | `claude-audit.log` | `easyrun claude`: satu baris per aksi (waktu lokal, path atau perintah Bash, penolakan, sambung/lepas) — tanpa isi berkas atau keluaran perintah; dipindah ke `.1` setelah 10 MiB | 0600 |
 | `claude-hand/` | `CLAUDE_CONFIG_DIR` untuk `claude mcp serve` milik tangan (terpisah dari config Claude-mu) | 0700 |
-| `cm/` | soket ssh ControlMaster per jalan `easyrun claude`, dihapus saat selesai (bila path folder config terlalu panjang untuk soket unix: `$TMPDIR/easyrun-<uid>/`) | 0700 |
+| `cm/` | soket ssh ControlMaster per jalan `easyrun claude` + `<soket>.pid` (pid easyrun pemilik dan pid master), dihapus saat selesai (bila path folder config terlalu panjang untuk soket unix: `$TMPDIR/easyrun-<uid>/`). Master yatim dari jalan yang mati mendadak (SIGKILL/panic) dibersihkan di jalan berikutnya: hanya bila pemiliknya sudah mati (`ssh -O exit` lewat soketnya); di Linux master juga menerima SIGTERM saat easyrun mati | 0700 |
 
 `ssh-config --write` juga menulis di luar `~/.easyrun/`:
 
