@@ -188,7 +188,7 @@ esac
 		t.Errorf("tangan lewat ssh sungguhan: tools %v, Read %v, tolak %v", names, readOK, denied)
 	}
 	bmu.Unlock()
-	for _, want := range []string{"easybox version", "easybox ensure main w1", "easybox ls", "easybox attach-ui main w1"} {
+	for _, want := range []string{"easybox version", "easybox ensure default w1", "easybox ls", "easybox attach-ui default w1"} {
 		if !strings.Contains(string(boxLog), want) {
 			t.Errorf("box tidak menjalankan %q:\n%s", want, boxLog)
 		}
