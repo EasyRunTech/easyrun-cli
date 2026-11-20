@@ -35,7 +35,7 @@ import (
 
 const (
 	// claudeDefaultSession — sesi herdr bawaan (kontrak P2 "Nama").
-	claudeDefaultSession = "main"
+	claudeDefaultSession = "default"
 	// easyboxProtocol — versi `easybox_protocol` yang dipahami program ini.
 	easyboxProtocol = 1
 	// handConnectWait — `easybox-hand-connect --wait`: detik menunggu soket
@@ -75,7 +75,8 @@ const claudeMore = `
   easyrun claude <box> <pane> stop
       hentikan claude di pane itu
 
-  <pane>, <sesi>: huruf/angka/._- (maks 40); sesi bawaan "main".
+  <pane>, <sesi>: huruf/angka/._- (maks 40); sesi bawaan "default"
+                 (= sesi yang dibuka Konsol mode herdr).
   --read-only    box hanya boleh Read (tanpa Bash/Edit/Write)
   --allow-home   izinkan folder home sebagai root (tidak disarankan)
 

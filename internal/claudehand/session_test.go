@@ -484,3 +484,26 @@ func TestReadLineBatas(t *testing.T) {
 		t.Fatalf("%q %v", l, err)
 	}
 }
+
+func TestReplacedNotice(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		params map[string]any
+		want   bool
+	}{
+		{"reason resmi, teks lain", map[string]any{"level": "warning", "data": "pane diambil alih", "reason": "replaced"}, true},
+		{"jembatan image (reason + teks)", map[string]any{"level": "warning", "logger": "easybox", "data": "digantikan laptop lain", "reason": "replaced"}, true},
+		{"jembatan P1 (teks saja)", map[string]any{"level": "warning", "data": "digantikan laptop lain"}, true},
+		{"reason lain", map[string]any{"level": "info", "data": "halo", "reason": "dibatalkan di box"}, false},
+		{"pesan biasa", map[string]any{"level": "info", "data": "laptop tersambung"}, false},
+		{"tanpa params", nil, false},
+	} {
+		msg := map[string]any{"jsonrpc": "2.0", "method": "notifications/message"}
+		if c.params != nil {
+			msg["params"] = c.params
+		}
+		if got := replacedNotice(msg); got != c.want {
+			t.Errorf("%s: replacedNotice = %v, mau %v", c.name, got, c.want)
+		}
+	}
+}

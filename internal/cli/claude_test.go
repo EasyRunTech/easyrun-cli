@@ -309,14 +309,14 @@ func TestClaudeAttachAlurLengkap(t *testing.T) {
 			idx["exit"] = i
 		case remoteIs(c, "easybox", "version"):
 			idx["version"] = i
-		case remoteIs(c, "easybox", "ensure", "main", "w1"):
+		case remoteIs(c, "easybox", "ensure", "default", "w1"):
 			idx["ensure"] = i
 		case remoteIs(c, "easybox-hand-connect", "w1", "--wait", "60"):
 			idx["hand"] = i
 			if !has(c.Flags, "-T") {
 				t.Errorf("tangan harus -T: %v", c.Flags)
 			}
-		case remoteIs(c, "easybox", "attach-ui", "main", "w1"):
+		case remoteIs(c, "easybox", "attach-ui", "default", "w1"):
 			idx["ui"] = i
 			if !has(c.Flags, "-t") {
 				t.Errorf("UI harus -t: %v", c.Flags)
@@ -375,7 +375,7 @@ func TestClaudeAttachAlurLengkap(t *testing.T) {
 		t.Errorf("izin audit %v", fi.Mode().Perm())
 	}
 	as := string(audit)
-	for _, want := range []string{"mulai box=contoh-box.easyrun.io pane=main:w1 root=" + ch.proj + " mode=full aksi=attach", "Read " + ch.proj + "/a.txt", `Bash "pwd"`, "tolak Read " + ch.outside, "selesai panggilan=3 ditolak=1"} {
+	for _, want := range []string{"mulai box=contoh-box.easyrun.io pane=default:w1 root=" + ch.proj + " mode=full aksi=attach", "Read " + ch.proj + "/a.txt", `Bash "pwd"`, "tolak Read " + ch.outside, "selesai panggilan=3 ditolak=1"} {
 		if !strings.Contains(as, want) {
 			t.Errorf("audit tidak memuat %q:\n%s", want, as)
 		}
@@ -410,14 +410,14 @@ func TestClaudeHandSambungUlang(t *testing.T) {
 		t.Errorf("sambungan tangan %d, ingin 2", conns())
 	}
 	errs := ch.stderr.String()
-	for _, want := range []string{"tersambung ke main:w1 — root " + ch.proj + " (mode read-only)", "✓ Read " + ch.proj + "/a.txt", "menyambung ulang dalam 1s", "1 panggilan tool, 0 ditolak"} {
+	for _, want := range []string{"tersambung ke default:w1 — root " + ch.proj + " (mode read-only)", "✓ Read " + ch.proj + "/a.txt", "menyambung ulang dalam 1s", "1 panggilan tool, 0 ditolak"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr tidak memuat %q:\n%s", want, errs)
 		}
 	}
 	hands, masters := 0, 0
 	for _, c := range ch.sshCalls() {
-		if remoteIs(c, "easybox", "attach-ui", "main", "w1") {
+		if remoteIs(c, "easybox", "attach-ui", "default", "w1") {
 			t.Error("mode hand tidak boleh membuka UI")
 		}
 		if c.Opts["ControlMaster"] == "yes" {
@@ -521,7 +521,7 @@ func TestClaudePreflightLokal(t *testing.T) {
 		}, nil, "folder rahasia"},
 		{"claude tidak ada", func(ch *claudeHarness) { ch.noClaude = true }, nil, "Claude Code tidak ditemukan di laptop ini"},
 		{"claude tanpa mcp serve", func(ch *claudeHarness) { ch.extra["FAKE_CLAUDE_NO_MCP"] = "1" }, nil, "`claude mcp serve` tidak jalan"},
-		{"attach tanpa terminal", func(ch *claudeHarness) { ch.tty = false }, nil, "attach butuh terminal interaktif; tanpa terminal pakai: easyrun claude uji-box main:w1 hand"},
+		{"attach tanpa terminal", func(ch *claudeHarness) { ch.tty = false }, nil, "attach butuh terminal interaktif; tanpa terminal pakai: easyrun claude uji-box default:w1 hand"},
 		{"windows", func(ch *claudeHarness) { ch.a.GOOS = "windows" }, nil, "belum didukung di Windows"},
 	}
 	for _, c := range cases {

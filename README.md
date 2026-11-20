@@ -108,7 +108,7 @@ Claude Code berjalan di EasyBox (pane herdr, login Claude di box), tetapi berkas
 
 ```bash
 cd ~/proyek/toko                         # root = folder ini
-easyrun claude contoh-box w1 attach      # buka pane w1 (sesi "main"); lepas dari herdr = selesai
+easyrun claude contoh-box w1 attach      # buka pane w1 (sesi "default", sama dengan Konsol mode herdr); lepas dari herdr = selesai
 easyrun claude contoh-box kerja:w2 hand  # tangan saja; lihat pane lewat Konsol di browser; Ctrl-C = lepas
 easyrun claude contoh-box ls             # pane, sesi, jalan?, laptop yang tersambung
 easyrun claude contoh-box w1 stop        # hentikan claude di pane itu

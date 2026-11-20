@@ -437,10 +437,16 @@ func schemaHas(tool map[string]any, prop string) bool {
 	return ok
 }
 
-// replacedNotice — pemberitahuan jembatan P1 sebelum menutup tangan lama:
-// {"method":"notifications/message","params":{"level":"warning","data":"digantikan laptop lain"}}.
+// replacedNotice — pemberitahuan jembatan sebelum menutup tangan lama karena
+// laptop lain tersambung:
+// {"method":"notifications/message","params":{"level":"warning","logger":"easybox","data":"digantikan laptop lain","reason":"replaced"}}.
+// `reason:"replaced"` = sinyal resmi (jembatan di image box); teks "digantikan"
+// di `data` = cadangan untuk jembatan P1 yang belum mengirim `reason`.
 func replacedNotice(msg map[string]any) bool {
 	p, _ := msg["params"].(map[string]any)
+	if r, _ := p["reason"].(string); r == "replaced" {
+		return true
+	}
 	d, _ := p["data"].(string)
 	return strings.Contains(strings.ToLower(d), "digantikan")
 }
