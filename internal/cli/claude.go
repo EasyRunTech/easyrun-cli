@@ -58,9 +58,11 @@ const (
 	handStableAfter = 30 * time.Second
 )
 
-// paneNameRe — <pane> dan <sesi> (kontrak P2 "Nama"); ikut masuk perintah
-// jarak jauh, jadi hanya karakter yang aman tanpa kutip.
-var paneNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,40}$`)
+// paneNameRe — <pane> dan <sesi> (kontrak P2 "Nama" + Amandemen 6): karakter
+// pertama huruf/angka (menolak "-h", ".", "..", ".x"), sisanya huruf/angka/._-,
+// total 1–40, dicocokkan UTUH (Go tanpa (?m): "$" = akhir teks). Ikut masuk
+// perintah jarak jauh, jadi hanya karakter yang aman tanpa kutip.
+var paneNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
 
 const claudeMore = `
   easyrun claude <box> ls
@@ -75,8 +77,8 @@ const claudeMore = `
   easyrun claude <box> <pane> stop
       hentikan claude di pane itu
 
-  <pane>, <sesi>: huruf/angka/._- (maks 40); sesi bawaan "default"
-                 (= sesi yang dibuka Konsol mode herdr).
+  <pane>, <sesi>: diawali huruf/angka, sisanya huruf/angka/._- (maks 40);
+                 sesi bawaan "default" (= sesi yang dibuka Konsol mode herdr).
   --read-only    box hanya boleh Read (tanpa Bash/Edit/Write)
   --allow-home   izinkan folder home sebagai root (tidak disarankan)
 
@@ -129,7 +131,7 @@ func parseClaudeArgs(args []string) (claudeArgs, error) {
 			ca.session, ca.pane = s, p
 		}
 		if !paneNameRe.MatchString(ca.session) || !paneNameRe.MatchString(ca.pane) {
-			return ca, fmt.Errorf("nama %q tidak valid: [<sesi>:]<pane>, huruf/angka/._- maks 40", api.Clean(pos[1]))
+			return ca, fmt.Errorf("nama %q tidak valid: [<sesi>:]<pane> — tiap nama diawali huruf/angka, sisanya huruf/angka/._-, maks 40 karakter", api.Clean(pos[1]))
 		}
 	default:
 		return ca, errors.New("argumen terlalu banyak")
@@ -344,8 +346,8 @@ type boxResult struct {
 
 // run — jalankan perintah box tanpa stdin; stdout = JSON satu baris, stderr =
 // pesan manusia (ditampilkan hanya bila gagal).
-func (c *boxConn) run(ctx context.Context, timeout time.Duration, cmd ...string) (boxResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+func (c *boxConn) run(parent context.Context, timeout time.Duration, cmd ...string) (boxResult, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	argv := c.argv(false, cmd...)
 	x := exec.CommandContext(ctx, c.sshPath, argv[1:]...)
@@ -355,12 +357,17 @@ func (c *boxConn) run(ctx context.Context, timeout time.Duration, cmd ...string)
 	x.Stdout, x.Stderr = &out, errb
 	err := x.Run()
 	res := boxResult{stdout: out.Bytes(), stderr: errb.String()}
+	// Dibatalkan pemanggil (Ctrl-C, UI keluar) ≠ batas waktu perintah ini:
+	// explain() mencetak "dibatalkan", bukan "tidak selesai dalam …".
+	if perr := parent.Err(); err != nil && perr != nil {
+		return res, fmt.Errorf("perintah `%s` di box: %w", strings.Join(cmd, " "), perr)
+	}
 	var ee *exec.ExitError
 	switch {
 	case err == nil:
 	case errors.As(err, &ee):
 		res.code = ee.ExitCode()
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return res, fmt.Errorf("perintah `%s` di box tidak selesai dalam %s", strings.Join(cmd, " "), timeout)
 		}
 	default:
@@ -619,7 +626,11 @@ func (a *App) claudeHands(ctx context.Context, conn *boxConn, d config.Dir, ca c
 		ready: make(chan struct{}), d: d, restartMux: ca.action == "hand",
 	}
 	if ca.action == "hand" {
-		h.log = func(s string) { fmt.Fprintf(a.Stderr, "%s %s\n", a.Now().Format("15:04:05"), s) }
+		// Lapis kedua: teks asal box sudah dinetralkan claudehand, tetapi
+		// setiap baris ke terminal tetap tanpa karakter kontrol mentah.
+		h.log = func(s string) {
+			fmt.Fprintf(a.Stderr, "%s %s\n", a.Now().Format("15:04:05"), claudehand.PrintableLines(s))
+		}
 	}
 	handCtx, stopHand := context.WithCancel(ctx)
 	loopDone := make(chan struct{})
@@ -644,7 +655,7 @@ func (a *App) claudeHands(ctx context.Context, conn *boxConn, d config.Dir, ca c
 			fmt.Fprintf(a.Stderr, "easyrun: tangan laptop masih menyambung di latar (claude di pane mungkin sedang menyala).\n")
 		case <-loopDone:
 			for _, n := range h.notes() {
-				fmt.Fprintf(a.Stderr, "easyrun: peringatan: tangan laptop tidak tersambung: %s\n", n)
+				fmt.Fprintf(a.Stderr, "easyrun: peringatan: tangan laptop tidak tersambung: %s\n", claudehand.PrintableLines(n))
 			}
 		case <-ctx.Done():
 		}
@@ -705,7 +716,7 @@ func (a *App) runClaudeUI(ctx context.Context, conn *boxConn, ca claudeArgs, std
 func (a *App) claudeSummary(stats *claudehand.Stats, notes []string, auditPath string) {
 	fmt.Fprintf(a.Stderr, "easyrun: tangan dilepas — box tidak lagi punya akses ke laptop ini. %d panggilan tool, %d ditolak penjaga. Log audit: %s\n", stats.Calls(), stats.Denied(), auditPath)
 	for _, n := range append(stats.Notes(), notes...) {
-		fmt.Fprintf(a.Stderr, "easyrun: catatan: %s\n", n)
+		fmt.Fprintf(a.Stderr, "easyrun: catatan: %s\n", claudehand.PrintableLines(n))
 	}
 }
 

@@ -180,6 +180,9 @@ func fakeBox(remote []string) int {
 		fmt.Fprintln(os.Stderr, "palsu: easybox", remote[1])
 		switch remote[1] {
 		case "version":
+			if d, err := time.ParseDuration(os.Getenv("FAKE_VERSION_SLEEP")); err == nil {
+				time.Sleep(d)
+			}
 			v := os.Getenv("FAKE_VERSION_JSON")
 			if v == "" {
 				v = `{"easybox_protocol":1,"easybox_version":"0.2.0","claude_path":"/home/ubuntu/.local/bin/claude","claude_version":"2.1.329","claude_logged_in":true,"herdr_version":"0.9.0"}`

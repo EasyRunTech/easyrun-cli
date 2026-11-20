@@ -148,9 +148,11 @@ func Serve(ctx context.Context, linkR io.Reader, linkW io.Writer, cfg Config) Re
 	return res
 }
 
+// log — satu baris untuk terminal. Hampir semua pesan memuat teks asal box
+// (perintah, path, nama tool), jadi selalu dinetralkan di sini.
 func (s *session) log(msg string) {
 	if s.cfg.Log != nil {
-		s.cfg.Log(msg)
+		s.cfg.Log(Printable(msg))
 	}
 }
 

