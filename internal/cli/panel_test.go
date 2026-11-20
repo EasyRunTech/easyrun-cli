@@ -30,8 +30,12 @@ const (
 )
 
 // TestMain — biner uji juga bisa berperan sebagai program `easyrun` (dipanggil
-// ssh sebagai ProxyCommand / Match exec pada uji ujung-ke-ujung).
+// ssh sebagai ProxyCommand / Match exec pada uji ujung-ke-ujung), atau sebagai
+// `ssh`/`claude` palsu untuk uji `easyrun claude` (claude_fake_test.go).
 func TestMain(m *testing.M) {
+	if code, ok := fakeMain(); ok {
+		os.Exit(code)
+	}
 	if os.Getenv(envMain) == "1" {
 		ctx, stop := SignalContext()
 		code := New(os.Stdin, os.Stdout, os.Stderr).Run(ctx, os.Args[1:])
