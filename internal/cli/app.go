@@ -55,10 +55,17 @@ type App struct {
 	TunnelCloseGrace   time.Duration
 	// GOOS — sistem tujuan untuk cara mengutip path; bawaan runtime.GOOS.
 	GOOS string
+	// Getwd — folder kerja (root `easyrun claude`); nil = os.Getwd.
+	Getwd func() (string, error)
+	// StdinIsTerminal — stdin terminal interaktif? nil = periksa a.Stdin.
+	StdinIsTerminal func() bool
 
 	// sshUser — hanya untuk uji ujung-ke-ujung dengan sshd lokal (sshd
 	// non-root hanya melayani pengguna yang menjalankannya); "" = ubuntu.
 	sshUser string
+	// boxBin — hanya untuk uji dengan sshd lokal: folder perintah easybox
+	// di "box"; "" = PATH box.
+	boxBin string
 
 	// configDirOpt, apiURLOpt — opsi global --config-dir / --api-url (sebelum
 	// nama perintah). Blok ssh-config membawanya ke ProxyCommand dan Match
@@ -125,6 +132,7 @@ func init() {
 			"  Tanpa --write: cetak blok; taruh di ~/.ssh/config DI ATAS semua \"Host *\".\n  --write   tulis ~/.ssh/easyrun/<id>.conf dan satu baris Include di puncak\n            ~/.ssh/config (cadangan sekali: ~/.ssh/config.easyrun.bak).\n  Setelahnya: ssh <box>, scp, rsync, sftp, dan VS Code Remote-SSH langsung jalan.\n", (*App).cmdSSHConfig},
 		{"ssh-prepare", "ssh-prepare <box>", "perbarui sertifikat SSH bila perlu", "  Dipanggil otomatis oleh blok Match exec dari ssh-config.\n", (*App).cmdSSHPrepare},
 		{"tunnel", "tunnel <box>", "saluran SSH lewat HTTPS (ProxyCommand)", "  Dipanggil ssh sebagai ProxyCommand; stdin/stdout = aliran SSH. Bukan untuk diketik langsung.\n", (*App).cmdTunnel},
+		{"claude", "claude <box> <pane> <aksi>", "Claude Code di box, berkas & perintah di laptop", claudeMore, (*App).cmdClaude},
 	}
 }
 
@@ -144,6 +152,7 @@ Contoh:
   easyrun ssh uji-box
   easyrun ssh uji-box -- -L 8080:localhost:8080
   easyrun ssh-config uji-box --write   lalu: ssh uji-box, scp, VS Code
+  easyrun claude uji-box w1 attach     claude di box, berkas di folder ini
 
 Opsi global (sebelum nama perintah):
   --config-dir DIR   folder konfigurasi (menggantikan %s)

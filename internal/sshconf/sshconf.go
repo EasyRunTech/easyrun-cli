@@ -259,7 +259,13 @@ func (p Params) options() ([]option, error) {
 // lalu argumen tambahan pengguna. OpenSSH tetap membaca opsi yang muncul
 // setelah tujuan (mis. `-L 8080:localhost:80`), dan sisanya menjadi perintah
 // jarak jauh. Tidak ada shell di antaranya — setiap argumen dikirim apa adanya.
-func Argv(p Params, extra []string) ([]string, error) {
+func Argv(p Params, extra []string) ([]string, error) { return ArgvWith(p, nil, extra) }
+
+// ArgvWith — seperti Argv, dengan argumen tambahan (mis. ControlMaster/
+// ControlPath untuk `easyrun claude`) sesudah opsi easyrun dan sebelum tujuan:
+// opsi easyrun tetap yang pertama (tidak bisa ditimpa), opsi tambahan menang
+// atas ~/.ssh/config pengguna.
+func ArgvWith(p Params, more, extra []string) ([]string, error) {
 	opts, err := p.options()
 	if err != nil {
 		return nil, err
@@ -268,9 +274,15 @@ func Argv(p Params, extra []string) ([]string, error) {
 	for _, o := range opts {
 		argv = append(argv, "-o", o.key+"="+o.value)
 	}
+	argv = append(argv, more...)
 	argv = append(argv, p.Hostname)
 	return append(argv, extra...), nil
 }
+
+// QuoteConfigPath — path sebagai nilai opsi ssh (-o / ssh_config): "%"
+// di-escape (ssh mengembangkan token %h, %C, …) dan dikutip ganda bila
+// memuat spasi; path yang tidak bisa dikutip dengan aman ditolak.
+func QuoteConfigPath(path, goos string) (string, error) { return quoteConfigPath(path, goos) }
 
 // ConfigBlock — blok untuk ~/.ssh/config. Blok Match tidak berisi opsi; ia
 // ada hanya supaya ssh menjalankan `ssh-prepare` (memperbarui sertifikat bila

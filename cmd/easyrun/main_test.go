@@ -24,6 +24,9 @@ func TestRun(t *testing.T) {
 		{[]string{"--ngawur"}, 2, "", `opsi "--ngawur" belum tersedia`},
 		{[]string{"ssh"}, 2, "", "nama box belum diisi"},
 		{[]string{"ssh", "--help"}, 0, "Pemakaian: easyrun ssh <box>", ""},
+		{[]string{"--help"}, 0, "easyrun claude <box> <pane> <aksi>", ""},
+		{[]string{"claude", "--help"}, 0, "[<sesi>:]<pane> attach [--read-only] [--allow-home]", ""},
+		{[]string{"claude", "uji-box", "w1"}, 2, "", "aksi untuk pane w1 belum diisi"},
 	}
 	for _, c := range cases {
 		var out, errb bytes.Buffer
