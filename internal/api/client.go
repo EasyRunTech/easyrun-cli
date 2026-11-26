@@ -57,6 +57,21 @@ const (
 	ReasonSessionLimit = "session_limit"
 )
 
+// Alasan penolakan rute tunnel publik (`data.reason`, kontrak F2 tunnel).
+const (
+	ReasonTunnelNameInvalid  = "tunnel_name_invalid"
+	ReasonTunnelNotAllowed   = "tunnel_not_allowed"
+	ReasonTunnelNameTaken    = "tunnel_name_taken"
+	ReasonTunnelLimitReached = "tunnel_limit_reached"
+	ReasonTunnelNotFound     = "tunnel_not_found"
+	ReasonTunnelForbidden    = "tunnel_forbidden"
+	ReasonTunnelRevoked      = "tunnel_revoked"
+	// ReasonTunnelDisabled — tunnel publik dimatikan di platform (saklar
+	// panel): datang dari 503 rute /cli/tunnels*. Penolakan tiket di gerbang
+	// tidak membawa reason ini, hanya kalimatnya (403 bertanda).
+	ReasonTunnelDisabled = "tunnel_disabled"
+)
+
 // Client — klien panel. Token kosong = permintaan tanpa auth.
 type Client struct {
 	BaseURL   string // origin API (tanpa /api/v1), sudah dinormalisasi
@@ -289,18 +304,25 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, auth 
 
 // doHeader — seperti do, sekaligus mengembalikan header jawaban sukses.
 func (c *Client) doHeader(ctx context.Context, method, path string, in, out any, auth bool) (http.Header, error) {
+	h, _, err := c.doStatus(ctx, method, path, in, out, auth)
+	return h, err
+}
+
+// doStatus — seperti doHeader, ditambah kode status jawaban sukses (mis.
+// 201 dibuat vs 200 sudah ada).
+func (c *Client) doStatus(ctx context.Context, method, path string, in, out any, auth bool) (http.Header, int, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		body = bytes.NewReader(b)
 	}
 	u := c.BaseURL + apiPrefix + path
 	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
 	if in != nil {
@@ -311,7 +333,7 @@ func (c *Client) doHeader(ctx context.Context, method, path string, in, out any,
 	}
 	if auth {
 		if c.Token == "" {
-			return nil, &Error{Status: http.StatusUnauthorized, Message: "belum masuk"}
+			return nil, 0, &Error{Status: http.StatusUnauthorized, Message: "belum masuk"}
 		}
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
@@ -326,28 +348,28 @@ func (c *Client) doHeader(ctx context.Context, method, path string, in, out any,
 	resp, err := noFollow.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
-		return nil, &NetError{Host: hostOf(c.BaseURL), Err: unwrapURLError(err)}
+		return nil, 0, &NetError{Host: hostOf(c.BaseURL), Err: unwrapURLError(err)}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
-		return nil, &NetError{Host: hostOf(c.BaseURL), Err: err}
+		return nil, 0, &NetError{Host: hostOf(c.BaseURL), Err: err}
 	}
 	if len(raw) > maxBody {
-		return nil, fmt.Errorf("respons %s %s terlalu besar", method, path)
+		return nil, 0, fmt.Errorf("respons %s %s terlalu besar", method, path)
 	}
 	if err := RedirectFromResponse(resp.StatusCode, resp.Header); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, ErrorFromResponse(resp.StatusCode, resp.Header, raw, time.Now())
+		return nil, 0, ErrorFromResponse(resp.StatusCode, resp.Header, raw, time.Now())
 	}
 	if out == nil {
-		return resp.Header, nil
+		return resp.Header, resp.StatusCode, nil
 	}
-	return resp.Header, decodeData(raw, out)
+	return resp.Header, resp.StatusCode, decodeData(raw, out)
 }
 
 func decodeData(raw []byte, out any) error {
@@ -519,6 +541,79 @@ func (c *Client) Ticket(ctx context.Context, boxID string) (*Ticket, error) {
 	}
 	if out.Ticket == "" || out.WSURL == "" {
 		return nil, errors.New("respons tiket tidak lengkap")
+	}
+	return &out, nil
+}
+
+// ---------- tunnel publik (kontrak F2 tunnel, rute token CLI) ----------
+
+// Tunnel — satu tunnel publik (`T` di kontrak). Host = <nama> + akhiran
+// tunnel platform; URL = alamat yang dilihat pengunjung.
+type Tunnel struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Host      string `json:"host"`
+	URL       string `json:"url"`
+	Ephemeral bool   `json:"ephemeral"`
+	Disabled  bool   `json:"disabled"`
+	CreatedAt string `json:"created_at"`
+}
+
+// TunnelTicket — jawaban POST /cli/tunnels/:id/ticket: tiket sekali pakai
+// untuk satu sambungan agen ke gerbang.
+type TunnelTicket struct {
+	Ticket    string `json:"ticket"`
+	ExpiresIn int    `json:"expires_in"`
+	AgentURL  string `json:"agent_url"`
+}
+
+// CreateTunnel — POST /cli/tunnels. name kosong = nama acak dari panel
+// (tunnel sementara). Nama yang sudah ada di tenant yang sama dipakai ulang.
+// created = panel membuat tunnel baru (201); false = tunnel yang sudah ada
+// dikembalikan (200) — tunnel itu bukan milik perintah ini.
+func (c *Client) CreateTunnel(ctx context.Context, name string) (t *Tunnel, created bool, err error) {
+	in := map[string]string{}
+	if name != "" {
+		in["name"] = name
+	}
+	var out struct {
+		Tunnel *Tunnel `json:"tunnel"`
+	}
+	_, status, err := c.doStatus(ctx, http.MethodPost, "/cli/tunnels", in, &out, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if out.Tunnel == nil || out.Tunnel.ID == "" || out.Tunnel.Host == "" {
+		return nil, false, errors.New("respons tunnel tidak lengkap")
+	}
+	return out.Tunnel, status == http.StatusCreated, nil
+}
+
+// Tunnels — GET /cli/tunnels: tunnel di tenant-tenant pengguna.
+func (c *Client) Tunnels(ctx context.Context) ([]Tunnel, error) {
+	var out struct {
+		Tunnels []Tunnel `json:"tunnels"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/cli/tunnels", nil, &out, true); err != nil {
+		return nil, err
+	}
+	return out.Tunnels, nil
+}
+
+// DeleteTunnel — DELETE /cli/tunnels/:id (204).
+func (c *Client) DeleteTunnel(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/cli/tunnels/"+url.PathEscape(id), nil, nil, true)
+}
+
+// TunnelTicket — POST /cli/tunnels/:id/ticket.
+func (c *Client) TunnelTicket(ctx context.Context, id string) (*TunnelTicket, error) {
+	var out TunnelTicket
+	path := "/cli/tunnels/" + url.PathEscape(id) + "/ticket"
+	if err := c.do(ctx, http.MethodPost, path, map[string]any{}, &out, true); err != nil {
+		return nil, err
+	}
+	if out.Ticket == "" || out.AgentURL == "" {
+		return nil, errors.New("respons tiket tunnel tidak lengkap")
 	}
 	return &out, nil
 }

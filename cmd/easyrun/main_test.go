@@ -30,7 +30,7 @@ func TestRun(t *testing.T) {
 	}
 	for _, c := range cases {
 		var out, errb bytes.Buffer
-		if got := run(context.Background(), c.args, strings.NewReader(""), &out, &errb); got != c.code {
+		if got := run(context.Background(), func() {}, c.args, strings.NewReader(""), &out, &errb); got != c.code {
 			t.Errorf("%v: kode %d, ingin %d (stderr %q)", c.args, got, c.code, errb.String())
 		}
 		if !strings.Contains(out.String(), c.stdout) {

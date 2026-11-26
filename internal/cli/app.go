@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/EasyRunTech/easyrun-cli/internal/api"
 	"github.com/EasyRunTech/easyrun-cli/internal/config"
@@ -53,6 +54,16 @@ type App struct {
 	// TunnelReadyTimeout, TunnelCloseGrace — uji; 0 = bawaan.
 	TunnelReadyTimeout time.Duration
 	TunnelCloseGrace   time.Duration
+	// ExposeBackoffMin, ExposeBackoffMax — jeda sambung ulang `expose`
+	// (uji); 0 = bawaan agen tunnel.
+	ExposeBackoffMin time.Duration
+	ExposeBackoffMax time.Duration
+	// StopSignals — kembalikan perilaku bawaan Ctrl-C (main memakai
+	// RestoreInterrupt; boleh dipanggil berkali-kali). `expose` memanggilnya
+	// setelah sinyal berhenti pertama, supaya Ctrl-C kedua langsung
+	// menghentikan proses selama pembersihan, sementara SIGTERM/SIGHUP
+	// berikutnya tetap tertangkap. nil = tidak ada.
+	StopSignals func()
 	// GOOS — sistem tujuan untuk cara mengutip path; bawaan runtime.GOOS.
 	GOOS string
 	// Getwd — folder kerja (root `easyrun claude`); nil = os.Getwd.
@@ -110,6 +121,9 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 func userAgent() string { return "easyrun/" + version.Version }
 
+// usageWidth — lebar kolom pemakaian di `easyrun --help`.
+const usageWidth = 30
+
 type command struct {
 	name  string
 	usage string
@@ -133,17 +147,24 @@ func init() {
 		{"ssh-prepare", "ssh-prepare <box>", "perbarui sertifikat SSH bila perlu", "  Dipanggil otomatis oleh blok Match exec dari ssh-config.\n", (*App).cmdSSHPrepare},
 		{"tunnel", "tunnel <box>", "saluran SSH lewat HTTPS (ProxyCommand)", "  Dipanggil ssh sebagai ProxyCommand; stdin/stdout = aliran SSH. Bukan untuk diketik langsung.\n", (*App).cmdTunnel},
 		{"claude", "claude <box> <pane> <aksi>", "Claude Code di box, berkas & perintah di laptop", claudeMore, (*App).cmdClaude},
+		{"expose", "expose <port> [--name NAMA] [--host HOST] [--rewrite-host]", "buka aplikasi lokal ke internet (alamat publik https)", exposeMore, (*App).cmdExpose},
+		{"tunnels", "tunnels [rm <nama>]", "daftar tunnel publik, atau hapus satu", tunnelsMore, (*App).cmdTunnels},
 	}
 }
 
 func (a *App) usage(w io.Writer) {
 	fmt.Fprintf(w, "easyrun %s — program baris perintah EasyRun\n\nPemakaian:\n", version.Version)
 	for _, c := range commands {
-		fmt.Fprintf(w, "  easyrun %-30s %s\n", c.usage, c.help)
+		if utf8.RuneCountInString(c.usage) > usageWidth {
+			// Pemakaian panjang: keterangan di baris berikutnya, tetap sejajar.
+			fmt.Fprintf(w, "  easyrun %s\n  %*s %s\n", c.usage, len("easyrun ")+usageWidth, "", c.help)
+			continue
+		}
+		fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, c.usage, c.help)
 	}
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--version", "tampilkan versi")
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--self-update", "perbarui ke versi terbaru")
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--help", "tampilkan bantuan ini")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--version", "tampilkan versi")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--self-update", "perbarui ke versi terbaru")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--help", "tampilkan bantuan ini")
 	fmt.Fprintf(w, `
 <box> = nama, hostname, atau id dari `+"`easyrun boxes`"+`.
 
@@ -153,6 +174,8 @@ Contoh:
   easyrun ssh uji-box -- -L 8080:localhost:8080
   easyrun ssh-config uji-box --write   lalu: ssh uji-box, scp, VS Code
   easyrun claude uji-box w1 attach     claude di box, berkas di folder ini
+  easyrun expose 3000                  alamat publik https untuk port 3000 laptop ini
+  easyrun expose 5173 --name demo --rewrite-host
 
 Opsi global (sebelum nama perintah):
   --config-dir DIR   folder konfigurasi (menggantikan %s)

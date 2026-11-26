@@ -30,7 +30,8 @@ func execSSH(path string, argv, env []string) (int, error) {
 
 func ignoreSIGPIPE() {}
 
-// SignalContext — dibatalkan oleh Ctrl+C.
+// SignalContext — dibatalkan oleh Ctrl+C. Fungsi stop-nya mengembalikan
+// perilaku sinyal bawaan.
 func SignalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt)
 }

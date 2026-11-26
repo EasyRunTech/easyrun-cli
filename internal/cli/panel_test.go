@@ -68,6 +68,8 @@ type fakePanel struct {
 	ws           func(*websocket.Conn, *http.Request)
 	tickets      map[string]string
 	wsHeaders    []http.Header
+	// tun — rute tunnel publik (expose_test.go).
+	tun *fakeTunnels
 }
 
 func ok(w http.ResponseWriter, data any) {
@@ -127,6 +129,7 @@ func newPanel(t *testing.T) *fakePanel {
 	mux.HandleFunc("POST /api/v1/instances/{id}/ssh/certificate", p.auth(p.handleCert))
 	mux.HandleFunc("POST /api/v1/instances/{id}/ssh/ticket", p.auth(p.handleTicket))
 	mux.HandleFunc("GET /api/v1/console/ws", p.handleWS)
+	p.tunnelRoutes(mux)
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		key := r.Method + " " + r.URL.Path

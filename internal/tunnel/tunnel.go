@@ -48,14 +48,29 @@ var pingFrame = []byte(`{"type":"ping"}`)
 // URLWithTicket — ws_url dari panel + ?ticket=. wss wajib; ws hanya ke
 // loopback (uji lokal). ws_url relatif diselesaikan terhadap alamat API.
 func URLWithTicket(wsURL, ticket, apiBase string) (string, error) {
-	u, err := url.Parse(wsURL)
+	u, err := ValidateWSURL("ws_url", wsURL, apiBase)
 	if err != nil {
-		return "", fmt.Errorf("ws_url dari server tidak valid: %w", err)
+		return "", err
+	}
+	q := u.Query()
+	q.Set("ticket", ticket)
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// ValidateWSURL — alamat WebSocket yang dikirim server (field = nama field
+// JSON-nya, untuk pesan galat: ws_url tiket SSH, agent_url tiket tunnel
+// publik). wss wajib; ws hanya ke loopback (uji lokal). Alamat relatif
+// diselesaikan terhadap alamat API (https → wss, http → ws).
+func ValidateWSURL(field, raw, apiBase string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s dari server tidak valid: %w", field, err)
 	}
 	if !u.IsAbs() {
 		base, err := url.Parse(apiBase)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		u = base.ResolveReference(u)
 		switch u.Scheme {
@@ -69,15 +84,12 @@ func URLWithTicket(wsURL, ticket, apiBase string) (string, error) {
 	case "wss":
 	case "ws":
 		if !config.IsLoopbackHost(u.Hostname()) {
-			return "", fmt.Errorf("ws_url dari server harus wss: %q", api.Clean(wsURL))
+			return nil, fmt.Errorf("%s dari server harus wss: %q", field, api.Clean(raw))
 		}
 	default:
-		return "", fmt.Errorf("ws_url dari server harus wss: %q", api.Clean(wsURL))
+		return nil, fmt.Errorf("%s dari server harus wss: %q", field, api.Clean(raw))
 	}
-	q := u.Query()
-	q.Set("ticket", ticket)
-	u.RawQuery = q.Encode()
-	return u.String(), nil
+	return u, nil
 }
 
 // Dial — buka WebSocket. Header yang dikirim hanya User-Agent: TANPA Origin

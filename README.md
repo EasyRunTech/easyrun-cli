@@ -79,6 +79,8 @@ Barisnya harus di atas karena ssh memakai nilai **pertama** yang ditemukannya un
 | `easyrun --config-dir DIR --api-url URL <perintah> …` | Opsi global (sebelum nama perintah), menggantikan `EASYRUN_CONFIG_DIR` / `EASYRUN_API_URL`. |
 
 | `easyrun claude <box> …` | Claude Code di box, berkas & perintah di laptop ini. Lihat [Claude Code di box](#claude-code-di-box-easyrun-claude). |
+| `easyrun expose <port> [--name NAMA] [--host HOST] [--rewrite-host]` | Buka aplikasi lokal ke internet lewat alamat publik https. Lihat [Tunnel publik](#tunnel-publik-easyrun-expose). |
+| `easyrun tunnels [rm <nama>]` | Tabel tunnel publik di tenant-tenant kamu (nama, URL, sementara, status, dibuat, id), atau hapus satu (nama atau id). |
 
 Butuh OpenSSH (`ssh`) di PATH: sudah ada di macOS dan kebanyakan Linux; Windows: fitur "OpenSSH Client".
 
@@ -137,6 +139,51 @@ Penjaga laptop (laptop tidak percaya box):
 
 Butuh: Claude Code di laptop (tidak perlu login) dan di box (sudah login: `easyrun ssh <box>` lalu `claude`), box versi terbaru (perintah `easybox`). Belum didukung di Windows (OpenSSH Windows tidak punya ControlMaster); `ls` dan `stop` tetap jalan.
 
+## Tunnel publik (`easyrun expose`)
+
+Membuka aplikasi yang jalan di laptop ke internet lewat alamat publik https milik EasyRun, tanpa membuka port di router.
+
+```
+  laptop                                   EasyRun
+  +-----------------------------+   1    +---------------------------+
+  | easyrun expose 3000         |------->| panel: buat tunnel,       |
+  |                             |<-------| tiket sekali pakai        |
+  |                             |   2    +---------------------------+
+  |  agen tunnel                |   3 WSS (tiket)  +----------------+
+  |   ^ stream per pengunjung   |<================>| gerbang tunnel |<--- pengunjung
+  |   v                         |                  +----------------+     https://<nama>-tunnel…
+  | aplikasi 127.0.0.1:3000     |
+  +-----------------------------+
+```
+
+```bash
+easyrun expose 3000                          # nama acak, dihapus saat berhenti
+easyrun expose 3000 --name demo              # alamat tetap, dipakai ulang lain kali
+easyrun expose 5173 --rewrite-host           # dev server yang menolak host asing (Vite)
+easyrun expose 8080 --host 192.168.1.20      # aplikasi di mesin lain di jaringan lokal
+easyrun tunnels                              # daftar tunnel
+easyrun tunnels rm demo                      # hapus; alamatnya langsung tidak berlaku
+```
+
+| Opsi | Arti | Bawaan |
+|---|---|---|
+| `<port>` | port aplikasi lokal (1–65535) | wajib |
+| `--name NAMA` | tunnel bernama: tetap ada setelah berhenti; tunnel kamu sendiri dengan nama itu dipakai ulang (easyrun memberi tahu "memakai tunnel … yang sudah ada"). Nama diperiksa panel (huruf kecil, angka, `-`) | nama acak dari panel, tunnel **sementara** |
+| `--host HOST` | alamat aplikasi lokal | `127.0.0.1` |
+| `--rewrite-host` | header `Host` diganti menjadi `HOST:PORT` sebelum sampai ke aplikasi | `Host` asli pengunjung |
+
+Opsi boleh ditulis sebelum atau sesudah `<port>`.
+
+- Alamat publik dicetak (stdout) begitu tunnel siap. Pesan sambung ulang dan catatan lain ke stderr.
+- Sambungan yang putus disambung ulang otomatis dengan jeda yang makin panjang (maks. 30 detik). Setiap sambungan memakai tiket baru dari panel (sekali pakai, berumur pendek); token CLI tidak pernah dikirim ke gerbang.
+- Berhenti tanpa sambung ulang bila panel menolak dengan alasan yang tidak sembuh dengan mencoba lagi (token dicabut, tunnel dihapus atau dinonaktifkan admin, akses tunnel tenant dimatikan). Batas laju (429, dengan `Retry-After`) dan gangguan sesaat (5xx, jaringan) dicoba ulang.
+- Ctrl-C atau SIGTERM (mis. `kill <pid>`) menghentikan tunnel dengan rapi; tunnel sementara yang **dibuat perintah ini** dihapus (upaya terbaik, batas 5 detik). Tunnel yang sudah ada sebelumnya (dipakai ulang lewat `--name`) tidak pernah dihapus. Ctrl-C yang jatuh tepat saat tunnel sementara sedang dibuat tetap menunggu jawaban panel (maks. 10 detik, dengan pesan) supaya tunnel itu tidak tertinggal; dengan `--name` tidak ada yang ditunggu. Ctrl-C kedua keluar paksa tanpa menunggu pembersihan. Bila gagal dihapus, easyrun menyebut perintah `easyrun tunnels rm <nama>`-nya — kecuali tunnel itu sedang dinonaktifkan admin (tidak bisa dihapus siapa pun dan tidak melayani pengunjung selama itu).
+- Belum ada `--detach`. Untuk berjalan di latar pakai tmux/screen (`tmux new -d -s tunnel 'easyrun expose 3000 --name demo'`) atau nohup (`nohup easyrun expose 3000 --name demo > expose.log 2>&1 &`; tetap jalan setelah terminal ditutup karena SIGHUP yang diabaikan nohup tidak dipasang ulang), lalu hentikan dengan `kill <pid>`.
+- Bila belum ada aplikasi di `HOST:PORT`, easyrun memperingatkan tetapi tunnel tetap dibuka; pengunjung melihat halaman galat sampai aplikasinya jalan.
+- Alamat gerbang (`agent_url`) dari panel wajib `wss://` (`ws://` hanya ke localhost untuk uji).
+
+Tunnel publik belum tersedia untuk semua tenant. Setiap alasan penolakan panel (`data.reason`) dijelaskan dengan kalimat dan langkah berikutnya: tunnel dimatikan di platform (`tunnel_disabled`), belum diizinkan untuk tenant (`tunnel_not_allowed`), nama tidak sah (`tunnel_name_invalid`), nama/alamat sudah dipakai (`tunnel_name_taken`), batas jumlah tunnel tercapai (`tunnel_limit_reached`, dengan petunjuk `easyrun tunnels`; tunnel yang dinonaktifkan admin ikut dihitung dan disebut namanya), tunnel milik anggota lain (`tunnel_forbidden`; owner org menghapusnya lewat panel, karena lewat CLI "owner" hanya berlaku untuk tenant pribadi), dinonaktifkan admin (`tunnel_revoked`), sudah dihapus (`tunnel_not_found`), dan terlalu banyak permintaan (`rate_limited`, dengan lama tunggunya bila disebut panel). Pesan dari panel dan gerbang dibersihkan dari karakter kendali sebelum dicetak.
+
 ## Yang disimpan, dan di mana
 
 Semua di `~/.easyrun/` (folder 0700):
@@ -193,7 +240,7 @@ go test ./...
 bash scripts/test-install.sh    # uji pemasang terhadap server lokal, tanpa GitHub
 ```
 
-Semua uji memakai panel palsu (`httptest`), tidak pernah server EasyRun. Uji `TestE2ESSHLewatTunnelKeSshd` menjalankan `ssh` dan `sshd -i` sungguhan bila keduanya terpasang (dilewati bila tidak): di Linux sampai perintah jalan dan 4 MiB bolak-balik; di macOS sampai autentikasi sertifikat (sshd non-root ditolak audit BSM setelah login).
+Semua uji memakai panel palsu (`httptest`), tidak pernah server EasyRun. Uji `expose` juga memakai gerbang tunnel palsu (WebSocket + yamux, kontrak kabel modul `easyrun-tunnel-agent`) yang membuka stream dan melakukan GET HTTP sampai aplikasi lokal. Uji `TestE2ESSHLewatTunnelKeSshd` menjalankan `ssh` dan `sshd -i` sungguhan bila keduanya terpasang (dilewati bila tidak): di Linux sampai perintah jalan dan 4 MiB bolak-balik; di macOS sampai autentikasi sertifikat (sshd non-root ditolak audit BSM setelah login).
 
 `easyrun claude`: uji penjaga di `internal/claudehand`; uji alur CLI memakai `ssh`/`claude` palsu (biner uji); `TestE2EClaudeLewatControlMaster` (Linux, ssh + `sshd -i` sungguhan) membuktikan semua saluran berbagi satu tiket/WebSocket/autentikasi. Uji silang dengan jembatan python rujukan P1 dan `claude mcp serve` sungguhan (dilewati di CI):
 
