@@ -58,9 +58,41 @@ const (
 	signalChildExpose = "expose" // expose dengan POST /cli/tunnels yang macet
 )
 
+// signalChildTimeout — batas menunggu jawaban atau keluarnya proses anak.
+const signalChildTimeout = 10 * time.Second
+
+// signalChild — proses anak uji sinyal. exec.Cmd.Wait dipanggil tepat
+// sekali, lewat exited: Wait kedua yang bersamaan (mis. di uji dan di
+// Cleanup) berebut data exec.Cmd (data race) dan satu hasil penyalin
+// Stderr, lalu salah satunya macet selamanya.
+type signalChild struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	out   *bufio.Reader
+	errb  *syncBuffer
+
+	once    sync.Once
+	done    chan struct{}
+	waitErr error // hasil Wait; dibaca hanya setelah <-exited()
+}
+
+// exited — channel yang ditutup setelah proses anak keluar; cmd.ProcessState
+// dan waitErr aman dibaca sesudahnya. Wait baru dijalankan pada panggilan
+// pertama, bukan langsung setelah Start: Wait menutup pipa stdout begitu
+// anak keluar, jadi pemanggil harus sudah selesai membaca stdout.
+func (c *signalChild) exited() <-chan struct{} {
+	c.once.Do(func() {
+		go func() {
+			c.waitErr = c.cmd.Wait()
+			close(c.done)
+		}()
+	})
+	return c.done
+}
+
 // startSignalChild — jalankan ulang biner uji ini sebagai proses anak.
 // ignoreHUP = SIGHUP diabaikan sebelum exec, persis seperti nohup.
-func startSignalChild(t *testing.T, scenario string, ignoreHUP bool) (*exec.Cmd, io.WriteCloser, *bufio.Reader, *syncBuffer) {
+func startSignalChild(t *testing.T, scenario string, ignoreHUP bool) *signalChild {
 	t.Helper()
 	trap := ""
 	if ignoreHUP {
@@ -81,11 +113,16 @@ func startSignalChild(t *testing.T, scenario string, ignoreHUP bool) (*exec.Cmd,
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	c := &signalChild{cmd: cmd, stdin: stdin, out: bufio.NewReader(stdout), errb: errb, done: make(chan struct{})}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		select {
+		case <-c.exited():
+		case <-time.After(signalChildTimeout):
+			t.Errorf("proses anak tidak keluar setelah dibunuh\nstderr:\n%s", errb)
+		}
 	})
-	return cmd, stdin, bufio.NewReader(stdout), errb
+	return c
 }
 
 // readChildLine — baris berikutnya dari stdout anak (batas waktu uji).
@@ -99,7 +136,7 @@ func readChildLine(t *testing.T, r *bufio.Reader, errb *syncBuffer) string {
 	select {
 	case s := <-ch:
 		return s
-	case <-time.After(10 * time.Second):
+	case <-time.After(signalChildTimeout):
 		t.Fatalf("proses anak tidak menjawab\nstderr:\n%s", errb)
 		return ""
 	}
@@ -126,18 +163,18 @@ func TestSignalContextHormatiSIGHUPDiabaikan(t *testing.T) {
 			if !tc.ignoreHUP && signal.Ignored(syscall.SIGHUP) {
 				t.Skip("SIGHUP sudah diabaikan di proses ini (nohup/daemon), jadi anak mewarisinya")
 			}
-			cmd, stdin, out, errb := startSignalChild(t, signalChildCtx, tc.ignoreHUP)
-			if got := readChildLine(t, out, errb); got != "siap" {
-				t.Fatalf("anak: %q\nstderr:\n%s", got, errb)
+			c := startSignalChild(t, signalChildCtx, tc.ignoreHUP)
+			if got := readChildLine(t, c.out, c.errb); got != "siap" {
+				t.Fatalf("anak: %q\nstderr:\n%s", got, c.errb)
 			}
-			if err := cmd.Process.Signal(tc.sig); err != nil {
+			if err := c.cmd.Process.Signal(tc.sig); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := io.WriteString(stdin, "lanjut\n"); err != nil {
+			if _, err := io.WriteString(c.stdin, "lanjut\n"); err != nil {
 				t.Fatal(err)
 			}
-			if got := readChildLine(t, out, errb); got != tc.want {
-				t.Fatalf("setelah %v: %q, mau %q\nstderr:\n%s", tc.sig, got, tc.want, errb)
+			if got := readChildLine(t, c.out, c.errb); got != tc.want {
+				t.Fatalf("setelah %v: %q, mau %q\nstderr:\n%s", tc.sig, got, tc.want, c.errb)
 			}
 		})
 	}
@@ -171,27 +208,25 @@ func TestExposeCtrlCKeduaKeluarPaksa(t *testing.T) {
 	if signal.Ignored(os.Interrupt) {
 		t.Skip("SIGINT diabaikan di proses ini (dijalankan di latar); perilaku bawaan tidak bisa diuji")
 	}
-	cmd, _, out, errb := startSignalChild(t, signalChildExpose, false)
-	if got := readChildLine(t, out, errb); got != "masuk" {
-		t.Fatalf("anak: %q\nstderr:\n%s", got, errb)
+	c := startSignalChild(t, signalChildExpose, false)
+	if got := readChildLine(t, c.out, c.errb); got != "masuk" {
+		t.Fatalf("anak: %q\nstderr:\n%s", got, c.errb)
 	}
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := c.cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "pesan tunggu dicetak", func() bool { return errb.contains("Ctrl-C sekali lagi untuk keluar paksa") })
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	waitFor(t, "pesan tunggu dicetak", func() bool { return c.errb.contains("Ctrl-C sekali lagi untuk keluar paksa") })
+	if err := c.cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
 	select {
-	case err := <-done:
-		ws, _ := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	case <-c.exited():
+		ws, _ := c.cmd.ProcessState.Sys().(syscall.WaitStatus)
 		if !ws.Signaled() || ws.Signal() != syscall.SIGINT {
-			t.Fatalf("Ctrl-C kedua harus menghentikan proses lewat SIGINT: %v (%v)\nstderr:\n%s", err, ws, errb)
+			t.Fatalf("Ctrl-C kedua harus menghentikan proses lewat SIGINT: %v (%v)\nstderr:\n%s", c.waitErr, ws, c.errb)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatalf("Ctrl-C kedua tertelan: proses masih menunggu\nstderr:\n%s", errb)
+		t.Fatalf("Ctrl-C kedua tertelan: proses masih menunggu\nstderr:\n%s", c.errb)
 	}
 }
 
@@ -203,22 +238,22 @@ func TestExposeSIGHUPKeduaTidakMembunuh(t *testing.T) {
 	if signal.Ignored(syscall.SIGHUP) {
 		t.Skip("SIGHUP diabaikan di proses ini (nohup/daemon); perilakunya tidak bisa diuji")
 	}
-	cmd, _, out, errb := startSignalChild(t, signalChildExpose, false)
-	if got := readChildLine(t, out, errb); got != "masuk" {
-		t.Fatalf("anak: %q\nstderr:\n%s", got, errb)
+	c := startSignalChild(t, signalChildExpose, false)
+	if got := readChildLine(t, c.out, c.errb); got != "masuk" {
+		t.Fatalf("anak: %q\nstderr:\n%s", got, c.errb)
 	}
-	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+	if err := c.cmd.Process.Signal(syscall.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "pesan tunggu dicetak", func() bool { return errb.contains("menunggu jawaban panel") })
-	if err := cmd.Process.Signal(syscall.SIGHUP); err != nil {
+	waitFor(t, "pesan tunggu dicetak", func() bool { return c.errb.contains("menunggu jawaban panel") })
+	if err := c.cmd.Process.Signal(syscall.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	// Proses anak masih hidup setelah jendela ini; Cleanup startSignalChild
+	// yang membunuhnya dan menunggu Wait yang sama (bukan Wait kedua).
 	select {
-	case err := <-done:
-		t.Fatalf("SIGHUP kedua tidak boleh menghentikan proses selama pembersihan: %v\nstderr:\n%s", err, errb)
+	case <-c.exited():
+		t.Fatalf("SIGHUP kedua tidak boleh menghentikan proses selama pembersihan: %v\nstderr:\n%s", c.waitErr, c.errb)
 	case <-time.After(time.Second):
 	}
 }

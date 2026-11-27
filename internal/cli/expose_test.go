@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -328,17 +329,59 @@ func (x *exposeRun) stop(t *testing.T) int {
 
 func (s *syncBuffer) contains(sub string) bool { return strings.Contains(s.String(), sub) }
 
+// haloLaptop — aplikasi lokal uji: menjawab metode dan path permintaan.
+func haloLaptop(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "halo dari laptop: %s %s", r.Method, r.URL.Path)
+}
+
+// localApp — aplikasi lokal yang listen di 127.0.0.1 saja (httptest).
 func localApp(t *testing.T) (port string) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "halo dari laptop: %s %s", r.Method, r.URL.Path)
-	}))
+	srv := httptest.NewServer(http.HandlerFunc(haloLaptop))
 	t.Cleanup(srv.Close)
 	u, err := url.Parse(srv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return u.Port()
+}
+
+// localApp6 — aplikasi lokal yang HANYA listen di [::1], seperti Vite di
+// Node >= 17 macOS dengan host bawaan "localhost". Dilewati bila IPv6
+// loopback tidak tersedia, bila "localhost" di sistem ini tidak mencakup ::1,
+// atau bila 127.0.0.1 dengan port yang sama kebetulan dipakai proses lain
+// (uji ini harus membuktikan jalur ::1).
+func localApp6(t *testing.T) (port string) {
+	t.Helper()
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback tidak tersedia: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(haloLaptop))
+	_ = srv.Listener.Close()
+	srv.Listener = ln
+	srv.Start()
+	t.Cleanup(srv.Close)
+	_, port, err = net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs, err := net.DefaultResolver.LookupHost(context.Background(), "localhost")
+	if err != nil {
+		t.Skipf("localhost tidak bisa di-resolve: %v", err)
+	}
+	has6 := false
+	for _, a := range addrs {
+		has6 = has6 || a == "::1"
+	}
+	if !has6 {
+		t.Skipf("localhost di sistem ini tidak mencakup ::1: %v", addrs)
+	}
+	if c, err := net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", port), time.Second); err == nil {
+		_ = c.Close()
+		t.Skipf("127.0.0.1:%s dipakai proses lain", port)
+	}
+	return port
 }
 
 // visit — "pengunjung": satu GET HTTP/1.1 lewat stream yamux gerbang → agen
@@ -397,8 +440,13 @@ func TestExposeUjungKeUjung(t *testing.T) {
 	if status != http.StatusOK || body != "halo dari laptop: GET /cek" {
 		t.Fatalf("jawaban lewat tunnel: %d %q", status, body)
 	}
-	if want := "https://acak-1" + tunnelHostSuffix + "  →  http://127.0.0.1:" + port; !x.out.contains(want) {
+	// R6: --host bawaan "localhost" (bukan 127.0.0.1); aplikasi httptest
+	// hanya listen di 127.0.0.1 dan tetap terjangkau tanpa peringatan.
+	if want := "https://acak-1" + tunnelHostSuffix + "  →  http://localhost:" + port; !x.out.contains(want) {
 		t.Fatalf("stdout tanpa %q:\n%s", want, x.out)
+	}
+	if x.errb.contains("belum ada aplikasi") {
+		t.Fatalf("aplikasi di 127.0.0.1 harus terjangkau lewat localhost:\n%s", x.errb)
 	}
 
 	_, hdrs := g.state()
@@ -408,7 +456,7 @@ func TestExposeUjungKeUjung(t *testing.T) {
 	if got := hdrs[0].Get("Authorization"); got != "Bearer tt-1" {
 		t.Fatalf("Authorization ke gerbang = %q, mau tiket panel", got)
 	}
-	if got := hdrs[0].Get(protocol.HeaderHostRewrite); got != "127.0.0.1:"+port {
+	if got := hdrs[0].Get(protocol.HeaderHostRewrite); got != "localhost:"+port {
 		t.Fatalf("%s = %q", protocol.HeaderHostRewrite, got)
 	}
 	if !strings.HasPrefix(hdrs[0].Get("User-Agent"), "easyrun/") {
@@ -455,10 +503,10 @@ func TestExposeNamaTetap(t *testing.T) {
 	h.loggedIn(t)
 	existing := h.p.addTunnel("demo", false)
 	g := newGateway(t, h.p)
-	x := h.startExpose(t, "--name", "demo", "--host", "localhost", localApp(t))
+	x := h.startExpose(t, "--name", "demo", "--host", "127.0.0.1", localApp(t))
 	g.nextSession(t)
 	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://demo" + tunnelHostSuffix) })
-	if !x.out.contains("http://localhost:") {
+	if !x.out.contains("http://127.0.0.1:") {
 		t.Fatalf("alamat lokal harus memakai --host:\n%s", x.out)
 	}
 	if code := x.stop(t); code != 0 {
@@ -677,6 +725,69 @@ func TestExposeArgumen(t *testing.T) {
 	}
 }
 
+// TestExposeRewriteHostDivalidasiSebelumMembuat — dengan --rewrite-host,
+// HOST:PORT dikirim sebagai X-Easyrun-Host-Rewrite dan gerbang menolak
+// nilai di luar nama host / IPv4 / [IPv6] (400 bertanda = fatal). --host
+// seperti itu harus ditolak sebagai galat pemakaian yang menyebut --host,
+// SEBELUM tunnel dibuat — bukan tunnel sementara dibuat lalu jabat tangan
+// gagal dengan nama header internal. Tanpa --rewrite-host nilainya hanya
+// dipakai dial lokal, jadi tetap diterima.
+func TestExposeRewriteHostDivalidasiSebelumMembuat(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	// Pengaman: bila validasinya hilang, pembuatan tunnel ditolak panel
+	// supaya uji gagal cepat (kode 1 + POST tercatat), tidak menyambung
+	// ke gerbang tanpa batas waktu.
+	h.p.tun.createFail = func(w http.ResponseWriter) bool {
+		failReason(w, http.StatusForbidden, "akses tunnel tenant dimatikan", api.ReasonTunnelNotAllowed)
+		return true
+	}
+	tolak := []string{
+		"my_app",                 // garis bawah
+		"fe80::1%lo0",            // zona IPv6
+		"[fe80::1%lo0]",          // zona IPv6 berkurung
+		"münchen.test",           // bukan ASCII
+		strings.Repeat("a", 254), // melebihi 253 karakter
+	}
+	for _, host := range tolak {
+		code := h.run("expose", "--rewrite-host", "--host", host, "3000")
+		if code != 2 {
+			t.Errorf("--host %q --rewrite-host: kode %d, mau 2\n%s", host, code, h.stderr)
+			continue
+		}
+		if errs := h.stderr.String(); !strings.Contains(errs, "--host") || !strings.Contains(errs, "--rewrite-host") || strings.Contains(errs, protocol.HeaderHostRewrite) {
+			t.Errorf("--host %q --rewrite-host: pesan harus menyebut --host dan --rewrite-host, bukan header internal:\n%s", host, errs)
+		}
+	}
+	if n := h.p.n("POST /api/v1/cli/tunnels"); n != 0 {
+		t.Fatalf("--host yang ditolak gerbang tidak boleh membuat tunnel: %d", n)
+	}
+
+	terima := []struct {
+		args []string
+		want string // nilai Host-Rewrite (localAddr)
+	}{
+		{[]string{"--rewrite-host", "3000"}, "localhost:3000"},
+		{[]string{"--rewrite-host", "--host", "127.0.0.1", "3000"}, "127.0.0.1:3000"},
+		{[]string{"--rewrite-host", "--host", "::1", "3000"}, "[::1]:3000"},
+		{[]string{"--rewrite-host", "--host", "[::1]", "3000"}, "[::1]:3000"},
+		{[]string{"--rewrite-host", "--host", "app-1.test", "3000"}, "app-1.test:3000"},
+		// Tanpa --rewrite-host: hanya dial lokal (mis. nama di /etc/hosts).
+		{[]string{"--host", "my_app", "3000"}, "my_app:3000"},
+		{[]string{"--host", "fe80::1%lo0", "3000"}, "[fe80::1%lo0]:3000"},
+	}
+	for _, tc := range terima {
+		x, code, ok := h.a.parseExposeArgs(tc.args)
+		if !ok {
+			t.Errorf("%v: ditolak (kode %d)\n%s", tc.args, code, h.stderr)
+			continue
+		}
+		if got := x.localAddr(); got != tc.want {
+			t.Errorf("%v: localAddr %q, mau %q", tc.args, got, tc.want)
+		}
+	}
+}
+
 func TestExposeBelumMasuk(t *testing.T) {
 	h := newHarness(t)
 	if code := h.run("expose", "3000"); code != 1 || !strings.Contains(h.stderr.String(), "easyrun login") {
@@ -825,7 +936,7 @@ func TestExposeBantuan(t *testing.T) {
 	if code := h.run("expose", "--help"); code != 0 {
 		t.Fatalf("kode %d", code)
 	}
-	for _, want := range []string{"--name NAMA", "--host HOST", "--rewrite-host", "Ctrl-C", "SIGTERM", "nohup easyrun expose", "tmux new -d", "--detach"} {
+	for _, want := range []string{"--name NAMA", "--host HOST", "bawaan localhost", "::1", "--rewrite-host", "Ctrl-C", "SIGTERM", "nohup easyrun expose", "tmux new -d", "--detach"} {
 		if !strings.Contains(h.stdout.String(), want) {
 			t.Fatalf("bantuan expose tanpa %q:\n%s", want, h.stdout)
 		}
@@ -945,16 +1056,23 @@ func TestGatewayRejectText(t *testing.T) {
 		fe   *agent.FatalError
 		want string
 	}{
-		{&agent.FatalError{Status: 401, Message: gatewayInvalidTicketMsg}, "gerbang tunnel menolak tiket sambungan: tiket tidak valid atau kedaluwarsa — ulangi perintahnya; bila tetap gagal, jalankan: easyrun login"},
-		{&agent.FatalError{Status: 401, Message: ""}, "gerbang tunnel menolak tiket sambungan — ulangi perintahnya"},
-		{&agent.FatalError{Status: 401, Message: "tiket\x1b[2J kedaluwarsa"}, "gerbang tunnel menolak tiket sambungan: tiket[2J kedaluwarsa — ulangi"},
+		// R4: 401 bertanda gerbang selalu soal tiket sambungan dan baru fatal
+		// setelah dicoba ulang dengan tiket baru — saran ulangi perintah,
+		// bukan login.
+		{&agent.FatalError{Status: 401, Message: gatewayInvalidTicketMsg}, "gerbang tunnel berulang kali menolak tiket sambungan: tiket tidak valid atau kedaluwarsa — ulangi perintahnya"},
+		{&agent.FatalError{Status: 401, Message: ""}, "gerbang tunnel berulang kali menolak tiket sambungan — ulangi perintahnya"},
+		{&agent.FatalError{Status: 401, Message: "tiket\x1b[2J kedaluwarsa"}, "gerbang tunnel berulang kali menolak tiket sambungan: tiket[2J kedaluwarsa — ulangi perintahnya"},
 		{&agent.FatalError{Status: 403, Message: ""}, "ditolak gerbang tunnel"},
 		{&agent.FatalError{Status: 404, Message: "path\u202e salah"}, "gerbang tunnel menolak (HTTP 404): path salah"},
 	}
 	for _, tc := range cases {
 		err := fmt.Errorf("ambil tiket: %w", tc.fe)
-		if got := explainTunnel(opTunnelRun, err); !strings.HasPrefix(got, tc.want) {
+		got := explainTunnel(opTunnelRun, err)
+		if !strings.HasPrefix(got, tc.want) {
 			t.Errorf("%+v: %q, mau berawalan %q", tc.fe, got, tc.want)
+		}
+		if tc.fe.Status == http.StatusUnauthorized && (got != tc.want || strings.Contains(got, "easyrun login")) {
+			t.Errorf("%+v: %q, mau persis %q (tanpa saran login)", tc.fe, got, tc.want)
 		}
 	}
 }
@@ -1135,20 +1253,133 @@ func TestExposeBatasTercapaiPetunjukDinonaktifkan(t *testing.T) {
 
 // TestExposeGerbangTiketTidakValid — K4: 401 bertanda gerbang sungguhan
 // berisi kalimat Indonesia; diteruskan ke pengguna apa adanya (dibersihkan).
+// R4: setiap 401 dicoba ulang dengan tiket baru sampai batas agen, baru
+// berhenti — dan pesannya menyarankan mengulang perintah, bukan login.
 func TestExposeGerbangTiketTidakValid(t *testing.T) {
 	h := newHarness(t)
 	h.loggedIn(t)
-	newGateway(t, h.p)
+	g := newGateway(t, h.p)
 	// Tiket panel tidak dikenal gerbang palsu → 401 bertanda.
 	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
-		okStatus(w, http.StatusCreated, map[string]any{"ticket": "tt-asing", "expires_in": 30, "agent_url": h.p.tun.agentURL})
+		okStatus(w, http.StatusCreated, map[string]any{"ticket": fmt.Sprintf("tt-asing-%d", n), "expires_in": 30, "agent_url": h.p.tun.agentURL})
 		return true
 	}
 	x := h.startExpose(t, "3000")
 	if code := x.wait(t); code != 1 {
 		t.Fatalf("kode %d\n%s", code, x.errb)
 	}
-	if !x.errb.contains("tunnel berhenti: gerbang tunnel menolak tiket sambungan: tiket tidak valid atau kedaluwarsa — ulangi perintahnya") {
+	if !x.errb.contains("tunnel berhenti: gerbang tunnel berulang kali menolak tiket sambungan: tiket tidak valid atau kedaluwarsa — ulangi perintahnya\n") {
 		t.Fatalf("stderr:\n%s", x.errb)
 	}
+	if x.errb.contains("easyrun login") {
+		t.Fatalf("401 gerbang bukan soal login, jangan sarankan easyrun login:\n%s", x.errb)
+	}
+	// Tiket pertama + satu tiket baru untuk setiap percobaan ulang.
+	wantTickets := agent.DefaultMaxTicketRejects + 1
+	n, deletes, _ := h.p.tunnelState()
+	if n != wantTickets {
+		t.Fatalf("permintaan tiket = %d, mau %d (dicoba ulang dengan tiket baru sebelum berhenti)\n%s", n, wantTickets, x.errb)
+	}
+	_, hdrs := g.state()
+	if len(hdrs) != wantTickets {
+		t.Fatalf("sambungan ke gerbang = %d, mau %d", len(hdrs), wantTickets)
+	}
+	seen := map[string]bool{}
+	for _, hd := range hdrs {
+		tk := hd.Get("Authorization")
+		if seen[tk] {
+			t.Fatalf("tiket dipakai ulang: %q", tk)
+		}
+		seen[tk] = true
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("tunnel sementara buatan sendiri tetap dihapus: %v", deletes)
+	}
+}
+
+// TestExposeGerbangTiketDitolakLaluPulih — R4: 401 bertanda gerbang yang
+// sembuh dengan tiket baru (mis. tiket kedaluwarsa di jabat tangan lambat)
+// tidak menghentikan expose: agen menyambung ulang dan pengunjung dilayani.
+func TestExposeGerbangTiketDitolakLaluPulih(t *testing.T) {
+	const rejected = agent.DefaultMaxTicketRejects - 1
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+		if n > rejected {
+			return false // tiket sah dari panel palsu
+		}
+		okStatus(w, http.StatusCreated, map[string]any{"ticket": fmt.Sprintf("tt-asing-%d", n), "expires_in": 30, "agent_url": h.p.tun.agentURL})
+		return true
+	}
+	x := h.startExpose(t, localApp(t))
+	sess := g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	if status, body := visit(t, sess, "acak-1"+tunnelHostSuffix, "/cek"); status != http.StatusOK || body != "halo dari laptop: GET /cek" {
+		t.Fatalf("jawaban lewat tunnel: %d %q", status, body)
+	}
+	if _, hdrs := g.state(); len(hdrs) != rejected+1 {
+		t.Fatalf("sambungan ke gerbang = %d, mau %d", len(hdrs), rejected+1)
+	}
+	errs := x.errb.String()
+	if got := strings.Count(errs, "menyambung ulang dalam"); got != rejected {
+		t.Fatalf("pesan sambung ulang = %d, mau %d:\n%s", got, rejected, errs)
+	}
+	if !strings.Contains(errs, gatewayInvalidTicketMsg) || strings.Contains(errs, "tunnel berhenti") {
+		t.Fatalf("stderr:\n%s", errs)
+	}
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("Ctrl-C harus keluar 0, dapat %d\n%s", code, x.errb)
+	}
+	if _, deletes, _ := h.p.tunnelState(); len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus saat berhenti: %v", deletes)
+	}
+}
+
+// TestExposeBawaanMenjangkauAplikasiHanyaIPv6 — R6: tanpa --host, dev server
+// yang hanya listen di ::1 (Vite di Node >= 17 macOS) tetap terjangkau:
+// pengunjung dapat 200 dan tidak ada peringatan "belum ada aplikasi".
+func TestExposeBawaanMenjangkauAplikasiHanyaIPv6(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	port := localApp6(t)
+	x := h.startExpose(t, port, "--rewrite-host")
+	sess := g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	if status, body := visit(t, sess, "acak-1"+tunnelHostSuffix, "/cek"); status != http.StatusOK || body != "halo dari laptop: GET /cek" {
+		t.Fatalf("jawaban lewat tunnel: %d %q\n%s", status, body, x.errb)
+	}
+	if x.errb.contains("belum ada aplikasi") {
+		t.Fatalf("aplikasi di ::1 dianggap belum jalan:\n%s", x.errb)
+	}
+	if want := "  →  http://localhost:" + port; !x.out.contains(want) {
+		t.Fatalf("stdout tanpa %q:\n%s", want, x.out)
+	}
+	if _, hdrs := g.state(); hdrs[0].Get(protocol.HeaderHostRewrite) != "localhost:"+port {
+		t.Fatalf("%s = %q", protocol.HeaderHostRewrite, hdrs[0].Get(protocol.HeaderHostRewrite))
+	}
+	x.stop(t)
+}
+
+// TestExposePeringatanBelumAdaAplikasi — probe bawaan memakai alamat yang
+// sama dengan agen: port kosong → peringatan menyebut localhost:PORT, tunnel
+// tetap dibuka.
+func TestExposePeringatanBelumAdaAplikasi(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	_ = ln.Close()
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	x := h.startExpose(t, port)
+	g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	if want := "easyrun: peringatan: belum ada aplikasi di localhost:" + port + ";"; !x.errb.contains(want) {
+		t.Fatalf("stderr tanpa %q:\n%s", want, x.errb)
+	}
+	x.stop(t)
 }

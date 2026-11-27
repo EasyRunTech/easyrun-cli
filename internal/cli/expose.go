@@ -27,6 +27,7 @@ import (
 	"time"
 
 	agent "github.com/EasyRunTech/easyrun-tunnel-agent"
+	"github.com/EasyRunTech/easyrun-tunnel-agent/protocol"
 
 	"github.com/EasyRunTech/easyrun-cli/internal/api"
 	"github.com/EasyRunTech/easyrun-cli/internal/tunnel"
@@ -34,7 +35,14 @@ import (
 
 const (
 	// defaultExposeHost — alamat aplikasi lokal bila --host tidak diisi.
-	defaultExposeHost = "127.0.0.1"
+	// Sengaja nama "localhost", bukan "127.0.0.1": dial Go me-resolve-nya
+	// ke ::1 dan 127.0.0.1 dan langsung mencoba alamat berikutnya bila yang
+	// pertama ditolak. Dev server yang hanya listen di ::1 (Vite/Node >= 17
+	// di macOS: "localhost" = ::1) tetap terjangkau, begitu juga aplikasi
+	// yang hanya listen di 127.0.0.1. Nilai yang sama dipakai dial agen,
+	// probe warnLocalDown, dan --rewrite-host (Host = localhost:PORT, yang
+	// diterima dev server).
+	defaultExposeHost = "localhost"
 	// exposeCleanupTimeout — batas menghapus tunnel sementara setelah Ctrl-C;
 	// upaya terbaik, pengguna tidak boleh menunggu lama.
 	exposeCleanupTimeout = 5 * time.Second
@@ -59,7 +67,8 @@ const (
 
 const exposeMore = `  --name NAMA       tunnel bernama (tetap ada setelah berhenti, dipakai ulang lain kali);
                     tanpa --name: nama acak, tunnel dihapus saat berhenti
-  --host HOST       alamat aplikasi lokal (bawaan ` + defaultExposeHost + `)
+  --host HOST       alamat aplikasi lokal (bawaan ` + defaultExposeHost + `: ::1 dan 127.0.0.1 dicoba,
+                    jadi dev server yang hanya listen di ::1 ikut terjangkau)
   --rewrite-host    ganti header Host menjadi HOST:PORT sebelum sampai ke aplikasi
                     (dev server seperti Vite menolak host asing)
   Alamat publik dicetak begitu tunnel siap. Sambungan yang putus disambung ulang
@@ -121,6 +130,13 @@ func (a *App) parseExposeArgs(args []string) (exposeArgs, int, bool) {
 		return x, a.usageError("expose", "--host diisi tanpa port; port ditulis sebagai argumen"), false
 	}
 	x.host = strings.TrimSuffix(strings.TrimPrefix(x.host, "["), "]")
+	// Tanpa --rewrite-host HOST hanya dipakai dial lokal (nama /etc/hosts
+	// bergaris bawah, IPv6 berzona boleh). Dengan --rewrite-host HOST:PORT
+	// juga dikirim ke gerbang sebagai Host pengganti; nilai yang ditolak
+	// gerbang (400 bertanda, fatal) ditolak di sini sebelum tunnel dibuat.
+	if x.rewriteHost && !protocol.ValidHostRewrite(x.localAddr()) {
+		return x, a.usageError("expose", fmt.Sprintf("--host %q tidak bisa dipakai dengan --rewrite-host: hanya huruf, angka, titik, tanda hubung, atau alamat IP tanpa zona (%%)", api.Clean(x.host))), false
+	}
 	x.name = strings.TrimSpace(x.name)
 	return x, 0, true
 }
@@ -575,11 +591,18 @@ func gatewayRejectText(fe *agent.FatalError) string {
 	msg := api.Clean(fe.Message)
 	switch fe.Status {
 	case http.StatusUnauthorized:
-		s := "gerbang tunnel menolak tiket sambungan"
+		// 401 bertanda gerbang selalu soal tiket sambungan (kosong, format
+		// salah, tidak dikenal, kedaluwarsa, sudah dipakai), bukan login:
+		// agen sudah mencoba ulang dengan tiket baru sampai batasnya
+		// (agent.DefaultMaxTicketRejects kali berturut-turut) sebelum
+		// berhenti. Token CLI yang dicabut ditolak panel saat meminta tiket
+		// (panelFatalError, lewat cabang *api.Error di explainTunnel), dan
+		// saran login ada di sana — di sini cukup ulangi perintahnya.
+		s := "gerbang tunnel berulang kali menolak tiket sambungan"
 		if msg != "" {
 			s += ": " + msg
 		}
-		return s + " — ulangi perintahnya; bila tetap gagal, jalankan: easyrun login"
+		return s + " — ulangi perintahnya"
 	case http.StatusForbidden:
 		if msg == "" {
 			return "ditolak gerbang tunnel"

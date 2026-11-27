@@ -152,7 +152,7 @@ Membuka aplikasi yang jalan di laptop ke internet lewat alamat publik https mili
   |  agen tunnel                |   3 WSS (tiket)  +----------------+
   |   ^ stream per pengunjung   |<================>| gerbang tunnel |<--- pengunjung
   |   v                         |                  +----------------+     https://<nama>-tunnel…
-  | aplikasi 127.0.0.1:3000     |
+  | aplikasi localhost:3000     |
   +-----------------------------+
 ```
 
@@ -169,14 +169,15 @@ easyrun tunnels rm demo                      # hapus; alamatnya langsung tidak b
 |---|---|---|
 | `<port>` | port aplikasi lokal (1–65535) | wajib |
 | `--name NAMA` | tunnel bernama: tetap ada setelah berhenti; tunnel kamu sendiri dengan nama itu dipakai ulang (easyrun memberi tahu "memakai tunnel … yang sudah ada"). Nama diperiksa panel (huruf kecil, angka, `-`) | nama acak dari panel, tunnel **sementara** |
-| `--host HOST` | alamat aplikasi lokal | `127.0.0.1` |
-| `--rewrite-host` | header `Host` diganti menjadi `HOST:PORT` sebelum sampai ke aplikasi | `Host` asli pengunjung |
+| `--host HOST` | alamat aplikasi lokal | `localhost`: `::1` dan `127.0.0.1` sama-sama dicoba, jadi dev server yang hanya listen di `::1` (mis. Vite di Node ≥ 17 macOS) maupun aplikasi yang hanya listen di `127.0.0.1` terjangkau |
+| `--rewrite-host` | header `Host` diganti menjadi `HOST:PORT` (tanpa `--host`: `localhost:PORT`) sebelum sampai ke aplikasi. `HOST` di sini hanya boleh huruf, angka, titik, tanda hubung, atau alamat IP tanpa zona (`%`); selain itu ditolak sebelum tunnel dibuat | `Host` asli pengunjung |
 
 Opsi boleh ditulis sebelum atau sesudah `<port>`.
 
 - Alamat publik dicetak (stdout) begitu tunnel siap. Pesan sambung ulang dan catatan lain ke stderr.
 - Sambungan yang putus disambung ulang otomatis dengan jeda yang makin panjang (maks. 30 detik). Setiap sambungan memakai tiket baru dari panel (sekali pakai, berumur pendek); token CLI tidak pernah dikirim ke gerbang.
 - Berhenti tanpa sambung ulang bila panel menolak dengan alasan yang tidak sembuh dengan mencoba lagi (token dicabut, tunnel dihapus atau dinonaktifkan admin, akses tunnel tenant dimatikan). Batas laju (429, dengan `Retry-After`) dan gangguan sesaat (5xx, jaringan) dicoba ulang.
+- Gerbang yang menolak tiket sambungan (401, mis. tiket kedaluwarsa saat jabat tangan lambat) dicoba ulang dengan tiket baru maksimal 3 kali berturut-turut; bila tetap ditolak, easyrun berhenti dengan saran mengulang perintahnya (bukan `easyrun login`: token CLI tidak pernah dikirim ke gerbang).
 - Ctrl-C atau SIGTERM (mis. `kill <pid>`) menghentikan tunnel dengan rapi; tunnel sementara yang **dibuat perintah ini** dihapus (upaya terbaik, batas 5 detik). Tunnel yang sudah ada sebelumnya (dipakai ulang lewat `--name`) tidak pernah dihapus. Ctrl-C yang jatuh tepat saat tunnel sementara sedang dibuat tetap menunggu jawaban panel (maks. 10 detik, dengan pesan) supaya tunnel itu tidak tertinggal; dengan `--name` tidak ada yang ditunggu. Ctrl-C kedua keluar paksa tanpa menunggu pembersihan. Bila gagal dihapus, easyrun menyebut perintah `easyrun tunnels rm <nama>`-nya — kecuali tunnel itu sedang dinonaktifkan admin (tidak bisa dihapus siapa pun dan tidak melayani pengunjung selama itu).
 - Belum ada `--detach`. Untuk berjalan di latar pakai tmux/screen (`tmux new -d -s tunnel 'easyrun expose 3000 --name demo'`) atau nohup (`nohup easyrun expose 3000 --name demo > expose.log 2>&1 &`; tetap jalan setelah terminal ditutup karena SIGHUP yang diabaikan nohup tidak dipasang ulang), lalu hentikan dengan `kill <pid>`.
 - Bila belum ada aplikasi di `HOST:PORT`, easyrun memperingatkan tetapi tunnel tetap dibuka; pengunjung melihat halaman galat sampai aplikasinya jalan.
@@ -231,6 +232,7 @@ Catatan keamanan:
 | Saklar SSH platform mati (503 "SSH belum tersedia") | "SSH sedang dimatikan di platform" |
 | Token CLI ditolak saat meminta daftar box, sertifikat, atau tiket (401) | "sesi CLI tidak berlaku (kedaluwarsa atau dicabut) — jalankan: easyrun login" |
 | Panel menolak saat membuka sambungan (401; biasanya tiket sekali pakai 30 detik sudah kedaluwarsa) | kalimat panel, lalu "ulangi perintahnya; bila tetap gagal, jalankan: easyrun login" |
+| `expose`: gerbang tunnel tetap menolak tiket sambungan (401) setelah dicoba ulang dengan tiket baru | "gerbang tunnel berulang kali menolak tiket sambungan", kalimat gerbang, lalu "ulangi perintahnya" |
 | Box mengirim galat lewat saluran (mis. image belum mendukung SSH) | kalimatnya apa adanya, tercetak sebelum pesan "Connection closed" milik ssh, dan keluar dengan kode ≠ 0 |
 
 ## Pengembangan
