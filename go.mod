@@ -10,8 +10,3 @@ require (
 )
 
 require golang.org/x/sys v0.47.0
-
-// TODO(F2 tunnel): hapus replace ini sebelum push — modul agen belum terbit
-// (repo publik EasyRunTech/easyrun-tunnel-agent + tag v0.1.0). Selama replace
-// masih ada, CI dan `go install` di luar laptop ini gagal.
-replace github.com/EasyRunTech/easyrun-tunnel-agent => ../easyrun-tunnel-agent
