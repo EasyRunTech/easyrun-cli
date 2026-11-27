@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,12 +67,22 @@ func (p *fakePanel) tunnelRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/cli/tunnels/{id}/ticket", p.auth(p.handleTunnelTicket))
 }
 
-// tunnelT — bentuk `T` persis kontrak (bukan tag struct klien).
+// tunnelT — bentuk `T` persis kontrak (bukan tag struct klien). Active nil =
+// panel lama tanpa field aditif `active`/`last_seen_at`; selain itu keduanya
+// selalu dikirim (`last_seen_at` null bila kosong).
 func tunnelT(t api.Tunnel) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"id": t.ID, "name": t.Name, "host": t.Host, "url": t.URL,
 		"ephemeral": t.Ephemeral, "disabled": t.Disabled, "created_at": t.CreatedAt,
 	}
+	if t.Active != nil {
+		m["active"] = *t.Active
+		m["last_seen_at"] = nil
+		if t.LastSeenAt != "" {
+			m["last_seen_at"] = t.LastSeenAt
+		}
+	}
+	return m
 }
 
 func okStatus(w http.ResponseWriter, status int, data any) {
@@ -125,6 +136,13 @@ func (p *fakePanel) handleTunnelCreate(w http.ResponseWriter, r *http.Request) {
 	defer p.mu.Unlock()
 	for _, t := range p.tun.list {
 		if name != "" && t.Name == name {
+			// Panel sungguhan (createNamed): nama milik tunnel sementara =
+			// 409 tunnel_name_taken (tak bisa diambil lewat nama), jadi 200
+			// tidak pernah membawa ephemeral=true.
+			if t.Ephemeral {
+				failReason(w, http.StatusConflict, "nama tunnel sudah dipakai — pilih nama lain", api.ReasonTunnelNameTaken)
+				return
+			}
 			okStatus(w, http.StatusOK, map[string]any{"tunnel": tunnelT(t)})
 			return
 		}
@@ -196,6 +214,9 @@ type fakeGateway struct {
 	headers      []http.Header
 	accepted     int
 	sessions     chan *yamux.Session
+	// down — true = gerbang sedang restart: 503 tanpa tanda (seperti Ingress),
+	// tiket tidak ditukar.
+	down func() bool
 }
 
 func newGateway(t *testing.T, p *fakePanel) *fakeGateway {
@@ -222,6 +243,13 @@ func newGateway(t *testing.T, p *fakePanel) *fakeGateway {
 }
 
 func (g *fakeGateway) handle(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	down := g.down
+	g.mu.Unlock()
+	if down != nil && down() {
+		http.Error(w, "gerbang sedang restart", http.StatusServiceUnavailable)
+		return
+	}
 	tk := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	g.p.mu.Lock()
 	id, valid := g.p.tun.tickets[tk]
@@ -293,7 +321,11 @@ func (h *harness) startExpose(t *testing.T, args ...string) *exposeRun {
 	t.Helper()
 	x := &exposeRun{out: &syncBuffer{}, errb: &syncBuffer{}, done: make(chan int, 1)}
 	h.a.Stdout, h.a.Stderr = x.out, x.errb
-	h.a.ExposeBackoffMin, h.a.ExposeBackoffMax = 5*time.Millisecond, 50*time.Millisecond
+	// Jeda sambung ulang agen (waktu sungguhan) dipendekkan, kecuali uji
+	// sudah mengisinya sendiri.
+	if h.a.ExposeBackoffMin == 0 {
+		h.a.ExposeBackoffMin, h.a.ExposeBackoffMax = 5*time.Millisecond, 50*time.Millisecond
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	x.cancel = cancel
 	go func() { x.done <- h.a.Run(ctx, append([]string{"expose"}, args...)) }()
@@ -575,8 +607,9 @@ func TestExposeSambungUlangTiketBaru(t *testing.T) {
 	}
 }
 
-// TestExposeTiketDitolakBerhenti — kontrak F2: 401/403/404/409 dari panel
-// saat meminta tiket sambung ulang = fatal; tunnel sementara tetap dihapus.
+// TestExposeTiketDitolakBerhenti — kontrak F2: 401/403/404 dari panel saat
+// meminta tiket sambung ulang = fatal; tunnel sementara tetap dihapus. Hanya
+// penolakan yang memang dikirim panel untuk tiket (tanpa 409).
 func TestExposeTiketDitolakBerhenti(t *testing.T) {
 	cases := []struct {
 		status       int
@@ -586,10 +619,12 @@ func TestExposeTiketDitolakBerhenti(t *testing.T) {
 		{401, "token CLI sudah dicabut", "", "jalankan: easyrun login"},
 		{403, "tunnel dinonaktifkan admin", api.ReasonTunnelRevoked, "tunnel ini dinonaktifkan admin EasyRun saat berjalan"},
 		{404, "tunnel tidak ditemukan", api.ReasonTunnelNotFound, "tunnel ini sudah dihapus"},
-		{409, "tunnel sedang dipakai perangkat lain", "", "tunnel sedang dipakai perangkat lain"},
+		{403, "tunnel ini milik anggota lain — hanya pembuat tunnel atau owner tenant yang boleh memakainya; pilih nama lain", api.ReasonTunnelForbidden, "hanya pembuatnya yang boleh memakainya"},
+		{403, "tunnel belum diizinkan untuk tenant ini — hubungi admin EasyRun", api.ReasonTunnelNotAllowed, "tunnel publik belum diizinkan untuk tenant ini"},
+		{403, "akses akun ini ke tenant tersebut sudah berubah — jalankan easyrun login", "membership_lost", "jalankan easyrun login"},
 	}
 	for _, tc := range cases {
-		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+		t.Run(fmt.Sprint(tc.status, tc.reason), func(t *testing.T) {
 			h := newHarness(t)
 			h.loggedIn(t)
 			g := newGateway(t, h.p)
@@ -675,12 +710,15 @@ func TestTicketErrorPemetaan(t *testing.T) {
 		{&api.Error{Status: 401}, true},
 		{&api.Error{Status: 403, Reason: api.ReasonTunnelNotAllowed}, true},
 		{&api.Error{Status: 404}, true},
+		// Panel tidak mengirim 409 untuk tiket; aturan umum 4xx = fatal.
 		{&api.Error{Status: 409}, true},
 		{&api.Error{Status: 408}, false},
 		{&api.Error{Status: 429}, false},
 		{&api.Error{Status: 500}, false},
 		{&api.Error{Status: 502}, false},
 		{&api.Error{Status: 503}, false},
+		// Saklar tunnel mati = berhenti; 503 tanpa reason tetap dicoba ulang.
+		{&api.Error{Status: 503, Reason: api.ReasonTunnelDisabled}, true},
 		{&api.NetError{Host: "api.contoh.test", Err: errors.New("batas waktu habis")}, false},
 		{&api.RedirectError{Status: 302, Location: "https://lain.test/"}, true},
 		{errors.New("respons tiket tunnel tidak lengkap"), false},
@@ -841,7 +879,8 @@ func TestExposeBuatDitolak(t *testing.T) {
 		{400, "", api.ReasonTunnelNameInvalid, "nama tunnel tidak sah"},
 		{403, "tunnel belum diizinkan untuk tenant ini", api.ReasonTunnelNotAllowed, "membuat tunnel: tunnel publik belum diizinkan untuk tenant ini — minta admin EasyRun"},
 		{403, "hanya pembuat tunnel atau owner tenant yang boleh menghapusnya", api.ReasonTunnelForbidden, "membuat tunnel: tunnel bernama ini milik anggota lain di tenant ini — pilih nama lain lewat --name (owner org bisa menghapus tunnel itu lewat panel EasyRun)"},
-		{403, "Tunnel belum tersedia", api.ReasonTunnelDisabled, "tunnel publik sedang dimatikan di platform"},
+		// Saklar TUNNEL_ENABLED mati: panel menjawab 503 + tunnel_disabled.
+		{503, "Tunnel belum tersedia", api.ReasonTunnelDisabled, "tunnel publik sedang dimatikan di platform"},
 		{503, "", "", "tunnel publik belum tersedia di platform"},
 		{503, "Tunnel publik sedang dimatikan", "", "Tunnel publik sedang dimatikan"},
 	}
@@ -951,28 +990,21 @@ func TestExposeBantuan(t *testing.T) {
 	}
 }
 
-// TestExposeNamaSementaraSesiLainTidakDihapus — C1: --name menunjuk tunnel
-// sementara yang sudah ada (200, dibuat sesi lain). Berhenti TIDAK boleh
-// menghapusnya: hanya tunnel sementara yang dibuat perintah ini (201).
-func TestExposeNamaSementaraSesiLainTidakDihapus(t *testing.T) {
+// TestExposeNamaTunnelSementaraDitolak — --name menunjuk tunnel sementara
+// yang sudah ada: panel menjawab 409 tunnel_name_taken (bukan 200), jadi
+// tunnel itu tidak disambung, tidak dihapus, dan tiket tidak diminta.
+func TestExposeNamaTunnelSementaraDitolak(t *testing.T) {
 	h := newHarness(t)
 	h.loggedIn(t)
 	other := h.p.addTunnel("acak-lain", true)
-	g := newGateway(t, h.p)
-	x := h.startExpose(t, "--name", other.Name, localApp(t))
-	g.nextSession(t)
-	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://" + other.Host) })
-	if code := x.stop(t); code != 0 {
-		t.Fatalf("kode %d\n%s", code, x.errb)
+	if code := h.run("expose", "--name", other.Name, "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
 	}
-	if _, deletes, _ := h.p.tunnelState(); len(deletes) != 0 {
-		t.Fatalf("tunnel sementara milik sesi lain ikut dihapus: %v\n%s", deletes, x.errb)
+	if !strings.Contains(h.stderr.String(), "membuat tunnel: nama/alamat tunnel ini sudah dipakai — pilih nama lain lewat --name") {
+		t.Fatalf("stderr:\n%s", h.stderr)
 	}
-	if !x.errb.contains("memakai tunnel acak-lain yang sudah ada") || !x.errb.contains("dibuat sesi lain, jadi tidak dihapus") {
-		t.Fatalf("stderr:\n%s", x.errb)
-	}
-	if x.errb.contains("dihapus saat berhenti") {
-		t.Fatalf("tidak boleh menjanjikan hapus saat berhenti:\n%s", x.errb)
+	if n, deletes, _ := h.p.tunnelState(); n != 0 || len(deletes) != 0 {
+		t.Fatalf("tiket %d / hapus %v: tunnel sementara orang lain tidak boleh disentuh", n, deletes)
 	}
 }
 
@@ -1120,7 +1152,7 @@ func TestExplainTunnelSetiapReason(t *testing.T) {
 		retry  time.Duration
 		want   string
 	}{
-		{opTunnelRun, 403, api.ReasonTunnelDisabled, 0, "tunnel publik sedang dimatikan di platform"},
+		{opTunnelRun, 503, api.ReasonTunnelDisabled, 0, "tunnel publik sedang dimatikan di platform"},
 		{opTunnelCreate, 403, api.ReasonTunnelNotAllowed, 0, "belum diizinkan untuk tenant ini — minta admin EasyRun"},
 		{opTunnelCreate, 400, api.ReasonTunnelNameInvalid, 0, "nama tunnel tidak sah"},
 		{opTunnelCreate, 409, api.ReasonTunnelNameTaken, 0, "nama/alamat tunnel ini sudah dipakai — pilih nama lain"},
@@ -1322,8 +1354,12 @@ func TestExposeGerbangTiketDitolakLaluPulih(t *testing.T) {
 		t.Fatalf("sambungan ke gerbang = %d, mau %d", len(hdrs), rejected+1)
 	}
 	errs := x.errb.String()
-	if got := strings.Count(errs, "menyambung ulang dalam"); got != rejected {
-		t.Fatalf("pesan sambung ulang = %d, mau %d:\n%s", got, rejected, errs)
+	// Belum pernah siap: "gagal menyambung … mencoba lagi", bukan "terputus".
+	if got := strings.Count(errs, "easyrun: gagal menyambung tunnel ("); got != rejected {
+		t.Fatalf("pesan coba lagi = %d, mau %d:\n%s", got, rejected, errs)
+	}
+	if strings.Contains(errs, "terputus") {
+		t.Fatalf("stderr:\n%s", errs)
 	}
 	if !strings.Contains(errs, gatewayInvalidTicketMsg) || strings.Contains(errs, "tunnel berhenti") {
 		t.Fatalf("stderr:\n%s", errs)
@@ -1382,4 +1418,826 @@ func TestExposePeringatanBelumAdaAplikasi(t *testing.T) {
 		t.Fatalf("stderr tanpa %q:\n%s", want, x.errb)
 	}
 	x.stop(t)
+}
+
+// ---------- review akhir F2 (fix5) ----------
+
+// setTunnel — ubah tunnel palsu bernama name di bawah kunci panel.
+func (p *fakePanel) setTunnel(name string, fn func(*api.Tunnel)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.tun.list {
+		if p.tun.list[i].Name == name {
+			fn(&p.tun.list[i])
+		}
+	}
+}
+
+// closedLoopbackPort — port 127.0.0.1 yang baru saja dilepas (tidak ada yang
+// listen).
+func closedLoopbackPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	_ = ln.Close()
+	return port
+}
+
+// TestExposeTunnelSedangDipakaiPeringatan — C1: 200 (tunnel bernama yang
+// sudah ada) dengan active=true → peringatan ke stderr SEBELUM menyambung
+// (sesi bernama sama di perangkat lain saling mengganti di gerbang), lalu
+// tetap tersambung. active=false atau panel lama tanpa field = tanpa
+// peringatan.
+func TestExposeTunnelSedangDipakaiPeringatan(t *testing.T) {
+	yes, no := true, false
+	const seen = "2026-11-27T02:30:00Z"
+	cases := []struct {
+		name     string
+		active   *bool
+		lastSeen string
+		warn     bool
+	}{
+		{"aktif-dengan-waktu", &yes, seen, true},
+		{"aktif-tanpa-waktu", &yes, "", true},
+		{"tidak-aktif", &no, seen, false},
+		{"panel-lama", nil, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.loggedIn(t)
+			h.p.addTunnel("demo", false)
+			h.p.setTunnel("demo", func(tn *api.Tunnel) { tn.Active, tn.LastSeenAt = tc.active, tc.lastSeen })
+			g := newGateway(t, h.p)
+			x := h.startExpose(t, "--name", "demo", localApp(t))
+			g.nextSession(t)
+			waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://demo" + tunnelHostSuffix) })
+			if code := x.stop(t); code != 0 {
+				t.Fatalf("kode %d\n%s", code, x.errb)
+			}
+			errs := x.errb.String()
+			const warn = "easyrun: peringatan: tunnel demo tampaknya sedang dipakai sesi lain"
+			if got := strings.Contains(errs, warn); got != tc.warn {
+				t.Fatalf("peringatan = %v, mau %v:\n%s", got, tc.warn, errs)
+			}
+			if !tc.warn {
+				return
+			}
+			for _, want := range []string{"keduanya akan saling memutus", "hentikan salah satunya"} {
+				if !strings.Contains(errs, want) {
+					t.Fatalf("peringatan tanpa %q:\n%s", want, errs)
+				}
+			}
+			if strings.Index(errs, warn) > strings.Index(errs, "Ctrl-C untuk berhenti") {
+				t.Fatalf("peringatan harus dicetak sebelum menyambung:\n%s", errs)
+			}
+			wantSeen := "(terakhir aktif " + createdAt(seen) + ")"
+			if got := strings.Contains(errs, wantSeen); got != (tc.lastSeen != "") {
+				t.Fatalf("%q tercetak = %v, mau %v:\n%s", wantSeen, got, tc.lastSeen != "", errs)
+			}
+			if tc.lastSeen == "" && strings.Contains(errs, "terakhir aktif") {
+				t.Fatalf("last_seen_at null tidak boleh menyebut waktu:\n%s", errs)
+			}
+		})
+	}
+}
+
+// TestTunnelsKolomTersambung — C1: `easyrun tunnels` menampilkan field aditif
+// active panel; panel lama (tanpa field) = "-".
+func TestTunnelsKolomTersambung(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	yes, no := true, false
+	h.p.addTunnel("a-aktif", false)
+	h.p.addTunnel("b-diam", false)
+	h.p.addTunnel("c-lama", false)
+	h.p.setTunnel("a-aktif", func(tn *api.Tunnel) { tn.Active = &yes })
+	h.p.setTunnel("b-diam", func(tn *api.Tunnel) { tn.Active = &no })
+	if code := h.run("tunnels"); code != 0 {
+		t.Fatalf("kode %d\n%s", code, h.stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(h.stdout.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("tabel:\n%s", h.stdout)
+	}
+	col := -1
+	for i, f := range strings.Fields(lines[0]) {
+		if f == "TERSAMBUNG" {
+			col = i
+		}
+	}
+	if col < 0 {
+		t.Fatalf("kolom TERSAMBUNG tidak ada:\n%s", h.stdout)
+	}
+	for i, want := range []string{"ya", "tidak", "-"} {
+		if f := strings.Fields(lines[i+1]); len(f) <= col || f[col] != want {
+			t.Fatalf("baris %d: TERSAMBUNG mau %q:\n%s", i+1, want, h.stdout)
+		}
+	}
+}
+
+// TestExposeBuatTenggatSementara — C2/N3: tanpa --name panel tidak menjawab
+// POST /cli/tunnels → kalimat Indonesia (bukan "context deadline exceeded"
+// atau galat jaringan) bahwa tunnel sementara mungkin sudah terbuat, cara
+// memeriksa dan menghapusnya, exit 1. Dua jalan: batas klien biasa habis
+// tanpa Ctrl-C, atau batas tunggu exposeCreateTimeout yang baru dihitung
+// SETELAH Ctrl-C.
+func TestExposeBuatTenggatSementara(t *testing.T) {
+	for _, ctrlC := range []bool{false, true} {
+		t.Run(fmt.Sprint("ctrl-c=", ctrlC), func(t *testing.T) {
+			h := newHarness(t)
+			h.loggedIn(t)
+			const limit = 200 * time.Millisecond
+			h.a.ExposeCreateTimeout = limit
+			if !ctrlC {
+				// Batas klien biasa (api.RequestTimeout), dipendekkan.
+				h.a.HTTP = &http.Client{Timeout: 300 * time.Millisecond, Transport: h.p.srv.Client().Transport}
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			t.Cleanup(func() { close(release) })
+			h.p.tun.createFail = func(http.ResponseWriter) bool {
+				once.Do(func() { close(entered) })
+				<-release
+				return false
+			}
+			x := h.startExpose(t, "3000")
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("POST /cli/tunnels tidak sampai ke panel")
+			}
+			if ctrlC {
+				// Panel lambat melewati exposeCreateTimeout: tanpa Ctrl-C itu
+				// masih menunggu (bukan tenggat sendiri).
+				time.Sleep(3 * limit / 2)
+				select {
+				case code := <-x.done:
+					x.done <- code
+					t.Fatalf("berhenti sebelum Ctrl-C (kode %d):\n%s", code, x.errb)
+				default:
+				}
+				x.cancel()
+			}
+			if code := x.wait(t); code != 1 {
+				t.Fatalf("kode %d, mau 1\n%s", code, x.errb)
+			}
+			errs := x.errb.String()
+			for _, want := range []string{
+				"easyrun: membuat tunnel: panel tidak menjawab dalam 1 detik",
+				"tunnel sementara mungkin sudah terbuat",
+				"cek dengan: easyrun tunnels",
+				"easyrun tunnels rm <nama>",
+			} {
+				if !strings.Contains(errs, want) {
+					t.Fatalf("stderr tanpa %q:\n%s", want, errs)
+				}
+			}
+			if got := strings.Contains(errs, "menunggu jawaban panel (maks 1 detik)"); got != ctrlC {
+				t.Fatalf("pesan tunggu = %v, mau %v:\n%s", got, ctrlC, errs)
+			}
+			if strings.Contains(errs, "deadline") || strings.Contains(errs, "tunnel dihentikan") || strings.Contains(errs, "dihapus otomatis") || strings.Contains(errs, "periksa koneksi") {
+				t.Fatalf("stderr:\n%s", errs)
+			}
+			if n, _, _ := h.p.tunnelState(); n != 0 {
+				t.Fatalf("tiket tidak boleh diminta: %d", n)
+			}
+		})
+	}
+}
+
+// TestExposeBuatLambatTanpaCtrlC — N3: tanpa --name dan tanpa Ctrl-C, panel
+// yang sah lambat (lebih lama dari exposeCreateTimeout, mis. tenant terkena
+// batas) tetap ditunggu sampai batas klien biasa — tunnel tersambung.
+func TestExposeBuatLambatTanpaCtrlC(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	h.a.ExposeCreateTimeout = 50 * time.Millisecond
+	h.p.tun.createFail = func(http.ResponseWriter) bool {
+		time.Sleep(300 * time.Millisecond)
+		return false
+	}
+	g := newGateway(t, h.p)
+	x := h.startExpose(t, localApp(t))
+	g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("kode %d\n%s", code, x.errb)
+	}
+	if x.errb.contains("tidak menjawab") {
+		t.Fatalf("stderr:\n%s", x.errb)
+	}
+	if _, deletes, _ := h.p.tunnelState(); len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus saat berhenti: %v", deletes)
+	}
+}
+
+// TestExposeNamaTanpaTenggatBuat — C2: dengan --name POST /cli/tunnels tidak
+// memakai batas pendek tunnel sementara (cukup batas klien biasa, tetap bisa
+// dibatalkan Ctrl-C): panel yang lambat tetap berakhir tersambung.
+func TestExposeNamaTanpaTenggatBuat(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	h.a.ExposeCreateTimeout = 50 * time.Millisecond
+	h.p.tun.createFail = func(http.ResponseWriter) bool {
+		time.Sleep(300 * time.Millisecond)
+		return false
+	}
+	g := newGateway(t, h.p)
+	x := h.startExpose(t, "--name", "lambat", localApp(t))
+	g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://lambat" + tunnelHostSuffix) })
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("kode %d\n%s", code, x.errb)
+	}
+	if x.errb.contains("deadline") || x.errb.contains("tidak menjawab") {
+		t.Fatalf("stderr:\n%s", x.errb)
+	}
+}
+
+// TestExposeTiketPertamaSementaraDicobaUlang — C3: sebelum tunnel pernah
+// siap, tiket PERTAMA yang gagal sesaat (429, 5xx, jaringan) dicoba ulang
+// dengan jeda (Retry-After dihormati), pesannya "gagal menyambung" (bukan
+// "terputus"), lalu tunnel tetap tersambung.
+func TestExposeTiketPertamaSementaraDicobaUlang(t *testing.T) {
+	cases := []struct {
+		name  string
+		fails int
+		reply func(http.ResponseWriter)
+	}{
+		{"429", 1, func(w http.ResponseWriter) {
+			w.Header().Set("Retry-After", "2")
+			failReason(w, 429, "terlalu sering meminta tiket tunnel — coba lagi sebentar lagi", api.ReasonRateLimited)
+		}},
+		{"500", 2, func(w http.ResponseWriter) { fail(w, 500, "panel sesaat bermasalah") }},
+		{"503", 1, func(w http.ResponseWriter) { fail(w, 503, "pemeriksaan tiket tunnel sedang tidak tersedia") }},
+		{"jaringan", 1, func(w http.ResponseWriter) {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.loggedIn(t)
+			h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+				if n > tc.fails {
+					return false
+				}
+				tc.reply(w)
+				return true
+			}
+			g := newGateway(t, h.p)
+			x := h.startExpose(t, localApp(t))
+			sess := g.nextSession(t)
+			waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+			if status, body := visit(t, sess, "acak-1"+tunnelHostSuffix, "/cek"); status != http.StatusOK || body != "halo dari laptop: GET /cek" {
+				t.Fatalf("jawaban lewat tunnel: %d %q", status, body)
+			}
+			if code := x.stop(t); code != 0 {
+				t.Fatalf("kode %d\n%s", code, x.errb)
+			}
+			errs := x.errb.String()
+			if got := strings.Count(errs, "easyrun: gagal menyambung tunnel ("); got != tc.fails {
+				t.Fatalf("pesan gagal menyambung = %d, mau %d:\n%s", got, tc.fails, errs)
+			}
+			if strings.Contains(errs, "terputus") || strings.Contains(errs, "meminta tiket tunnel:") {
+				t.Fatalf("sebelum siap bukan terputus/fatal:\n%s", errs)
+			}
+			if tc.name == "429" {
+				h.clock.mu.Lock()
+				sleeps := append([]time.Duration(nil), h.clock.sleeps...)
+				h.clock.mu.Unlock()
+				if len(sleeps) == 0 || sleeps[0] != 2*time.Second {
+					t.Fatalf("Retry-After 2 dtk tiket pertama tidak dihormati: %v", sleeps)
+				}
+			}
+			if _, deletes, _ := h.p.tunnelState(); len(deletes) != 1 {
+				t.Fatalf("tunnel sementara harus dihapus saat berhenti: %v", deletes)
+			}
+		})
+	}
+}
+
+// slept — jumlah dan daftar Sleep jam palsu.
+func (c *fakeClock) slept() (time.Duration, []time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var sum time.Duration
+	for _, d := range c.sleeps {
+		sum += d
+	}
+	return sum, append([]time.Duration(nil), c.sleeps...)
+}
+
+// startBudgetSecs — exposeStartBudget dalam detik, seperti di pesan.
+var startBudgetSecs = int(exposeStartBudget / time.Second)
+
+// TestExposeTiketPertamaTerusGagalBerhenti — C3/N2: tiket pertama gagal
+// sesaat terus-menerus → dicoba ulang sampai anggaran waktu exposeStartBudget
+// habis (jeda terakhir dipangkas ke sisa anggaran, tidak lewat), lalu
+// berhenti dengan pesan yang menyebut panel dan sebabnya; exit 1; tunnel
+// sementara dihapus.
+func TestExposeTiketPertamaTerusGagalBerhenti(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	h.p.tun.ticketFail = func(w http.ResponseWriter, _ int) bool {
+		fail(w, 502, "panel sesaat bermasalah")
+		return true
+	}
+	if code := h.run("expose", "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
+	}
+	sum, sleeps := h.clock.slept()
+	if sum != exposeStartBudget {
+		t.Fatalf("total jeda %v, mau persis anggaran %v: %v", sum, exposeStartBudget, sleeps)
+	}
+	n, deletes, _ := h.p.tunnelState()
+	if n != len(sleeps)+1 {
+		t.Fatalf("permintaan tiket = %d, mau %d (satu per jeda + yang pertama)", n, len(sleeps)+1)
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus: %v", deletes)
+	}
+	u, _ := url.Parse(h.p.srv.URL)
+	errs := h.stderr.String()
+	want := fmt.Sprintf("easyrun: gagal menyambung tunnel: panel %s tidak memberi tiket dalam %d detik: ", u.Host, startBudgetSecs)
+	if !strings.Contains(errs, want) || !strings.Contains(errs, "(HTTP 502)") {
+		t.Fatalf("stderr tanpa %q:\n%s", want, errs)
+	}
+	if !strings.Contains(errs, fmt.Sprintf("(sisa waktu menyambung %d detik)", startBudgetSecs)) {
+		t.Fatalf("pesan coba lagi harus menyebut sisa waktu:\n%s", errs)
+	}
+	if strings.Contains(errs, "terputus") || strings.Contains(errs, "percobaan") {
+		t.Fatalf("stderr:\n%s", errs)
+	}
+}
+
+// TestExposeStartJedaTidakMelewatiAnggaran — N2: Retry-After yang lebih
+// panjang dari sisa anggaran dipangkas ke sisanya; percobaan terakhir tepat
+// di batas anggaran.
+func TestExposeStartJedaTidakMelewatiAnggaran(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	retry := exposeStartBudget * 5 / 6
+	h.p.tun.ticketFail = func(w http.ResponseWriter, _ int) bool {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry/time.Second)))
+		failReason(w, 429, "terlalu sering meminta tiket tunnel — coba lagi sebentar lagi", api.ReasonRateLimited)
+		return true
+	}
+	if code := h.run("expose", "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
+	}
+	_, sleeps := h.clock.slept()
+	if want := []time.Duration{retry, exposeStartBudget - retry}; fmt.Sprint(sleeps) != fmt.Sprint(want) {
+		t.Fatalf("jeda %v, mau %v (Retry-After dihormati, lalu dipangkas ke sisa anggaran)", sleeps, want)
+	}
+	if !strings.Contains(h.stderr.String(), "terlalu sering meminta tiket tunnel") {
+		t.Fatalf("stderr:\n%s", h.stderr)
+	}
+}
+
+// TestExposeGerbangTakTerjangkauBerhenti — C3/N2: gerbang tidak terjangkau
+// sejak awal (DNS salah, gerbang mati) tidak lagi "terputus … menyambung
+// ulang" selamanya: dicoba ulang sampai anggaran waktu habis, lalu berhenti
+// dengan alamat gerbang + sebab, exit 1, tunnel sementara dihapus.
+func TestExposeGerbangTakTerjangkauBerhenti(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	port := closedLoopbackPort(t)
+	h.p.tun.agentURL = "ws://127.0.0.1:" + port + protocol.AgentConnectPath
+	if code := h.run("expose", "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
+	}
+	errs := h.stderr.String()
+	want := fmt.Sprintf("easyrun: gagal menyambung tunnel ke gerbang 127.0.0.1:%s dalam %d detik: ", port, startBudgetSecs)
+	if !strings.Contains(errs, want) {
+		t.Fatalf("stderr tanpa %q:\n%s", want, errs)
+	}
+	sum, sleeps := h.clock.slept()
+	if sum != exposeStartBudget {
+		t.Fatalf("total jeda %v, mau %v: %v", sum, exposeStartBudget, sleeps)
+	}
+	if got := strings.Count(errs, "mencoba lagi dalam"); got != len(sleeps) {
+		t.Fatalf("pesan coba lagi = %d, mau %d:\n%s", got, len(sleeps), errs)
+	}
+	if strings.Contains(errs, "terputus") || strings.Contains(errs, "menyambung ulang") {
+		t.Fatalf("belum pernah tersambung, jangan sebut terputus:\n%s", errs)
+	}
+	n, deletes, _ := h.p.tunnelState()
+	if n != len(sleeps)+1 {
+		t.Fatalf("permintaan tiket = %d, mau %d", n, len(sleeps)+1)
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus: %v", deletes)
+	}
+}
+
+// TestExposeGerbangRestartSaatMulai — N2: gerbang (satu replika) sedang
+// restart/deploy saat expose dijalankan — 503 tanpa tanda selama sebagian
+// anggaran — tetap berakhir tersambung, bukan gagal setelah beberapa detik.
+func TestExposeGerbangRestartSaatMulai(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	t0 := h.clock.Now()
+	downFor := exposeStartBudget / 3
+	g.down = func() bool { return h.clock.Now().Sub(t0) < downFor }
+	// Jeda bawaan agen: anggaran diuji dengan jam palsu, bukan waktu sungguhan.
+	h.a.ExposeBackoffMin, h.a.ExposeBackoffMax = agent.DefaultBackoffMin, agent.DefaultBackoffMax
+	x := h.startExpose(t, localApp(t))
+	sess := g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	if status, body := visit(t, sess, "acak-1"+tunnelHostSuffix, "/cek"); status != http.StatusOK || body != "halo dari laptop: GET /cek" {
+		t.Fatalf("jawaban lewat tunnel: %d %q", status, body)
+	}
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("kode %d\n%s", code, x.errb)
+	}
+	if !x.errb.contains("easyrun: gagal menyambung tunnel (gerbang menjawab 503") || x.errb.contains("terputus") {
+		t.Fatalf("stderr:\n%s", x.errb)
+	}
+}
+
+// TestExposeTiketPertamaGagalLaluGerbangTolakTiket — N1: tiket pertama 503
+// dua kali, lalu gerbang terus menolak tiket (401 bertanda): berhenti dengan
+// penjelasan agen yang sama ("berulang kali menolak … ulangi perintahnya"),
+// bukan "(401)" mentah dari jatah percobaan.
+func TestExposeTiketPertamaGagalLaluGerbangTolakTiket(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	newGateway(t, h.p)
+	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+		if n <= 2 {
+			fail(w, 503, "panel sesaat bermasalah")
+			return true
+		}
+		okStatus(w, http.StatusCreated, map[string]any{"ticket": fmt.Sprintf("tt-asing-%d", n), "expires_in": 30, "agent_url": h.p.tun.agentURL})
+		return true
+	}
+	if code := h.run("expose", "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
+	}
+	errs := h.stderr.String()
+	if !strings.Contains(errs, "easyrun: tunnel berhenti: gerbang tunnel berulang kali menolak tiket sambungan: "+gatewayInvalidTicketMsg+" — ulangi perintahnya\n") {
+		t.Fatalf("stderr:\n%s", errs)
+	}
+	if n, _, _ := h.p.tunnelState(); n != 2+agent.DefaultMaxTicketRejects+1 {
+		t.Fatalf("permintaan tiket = %d, mau %d", n, 2+agent.DefaultMaxTicketRejects+1)
+	}
+}
+
+// TestExposeAnggaranHabisSaatGerbangTolakTiket — N1: anggaran habis tepat
+// saat gerbang menolak tiket (401 bertanda): pesan akhir memakai penjelasan
+// gerbang (gatewayRejectText: "… ulangi perintahnya"), bukan "(401)" mentah.
+func TestExposeAnggaranHabisSaatGerbangTolakTiket(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	t0 := h.clock.Now()
+	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+		if h.clock.Now().Sub(t0) < exposeStartBudget {
+			fail(w, 503, "panel sesaat bermasalah")
+			return true
+		}
+		okStatus(w, http.StatusCreated, map[string]any{"ticket": fmt.Sprintf("tt-asing-%d", n), "expires_in": 30, "agent_url": h.p.tun.agentURL})
+		return true
+	}
+	if code := h.run("expose", "3000"); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, h.stderr)
+	}
+	gw, _ := url.Parse(g.srv.URL)
+	errs := h.stderr.String()
+	want := fmt.Sprintf("easyrun: gagal menyambung tunnel ke gerbang %s dalam %d detik: gerbang tunnel berulang kali menolak tiket sambungan: %s — ulangi perintahnya\n", gw.Host, startBudgetSecs, gatewayInvalidTicketMsg)
+	if !strings.Contains(errs, want) || strings.Contains(errs, "(401)") {
+		t.Fatalf("stderr tanpa %q:\n%s", want, errs)
+	}
+}
+
+// TestExposeSetelahSiapSambungUlangTanpaBatas — C3: setelah tunnel pernah
+// siap, gerbang yang hilang disambung ulang tanpa batas (tidak berhenti
+// karena anggaran menyambung, yang hanya berlaku sebelum siap).
+func TestExposeSetelahSiapSambungUlangTanpaBatas(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	x := h.startExpose(t, localApp(t))
+	sess := g.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	g.srv.Close()
+	_ = sess.Close()
+	const manyReconnects = 8
+	waitFor(t, "sambung ulang berkali-kali", func() bool {
+		return strings.Count(x.errb.String(), "tunnel terputus") > manyReconnects
+	})
+	select {
+	case code := <-x.done:
+		x.done <- code
+		t.Fatalf("expose berhenti (kode %d) padahal pernah siap:\n%s", code, x.errb)
+	default:
+	}
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("kode %d\n%s", code, x.errb)
+	}
+}
+
+// TestExposeGerbangPindah — C4: agent_url tiket sambung ulang berbeda dari
+// gerbang yang sedang dipakai → CLI menyambung ke gerbang baru (bukan terus
+// memanggil gerbang lama), pengunjung dilayani lewat gerbang baru.
+func TestExposeGerbangPindah(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g1 := newGateway(t, h.p)
+	x := h.startExpose(t, localApp(t))
+	s1 := g1.nextSession(t)
+	waitFor(t, "alamat publik dicetak", func() bool { return x.out.contains("https://acak-1" + tunnelHostSuffix) })
+	g2 := newGateway(t, h.p) // panel kini menjawab agent_url gerbang kedua
+	_ = s1.Close()
+	s2 := g2.nextSession(t)
+	if status, body := visit(t, s2, "acak-1"+tunnelHostSuffix, "/cek"); status != http.StatusOK || body != "halo dari laptop: GET /cek" {
+		t.Fatalf("jawaban lewat gerbang baru: %d %q", status, body)
+	}
+	if n, _ := g1.state(); n != 1 {
+		t.Fatalf("gerbang lama dipanggil lagi: %d sambungan", n)
+	}
+	u, _ := url.Parse(g2.srv.URL)
+	if want := "easyrun: panel memindahkan tunnel ke gerbang " + u.Host + "; menyambung ke sana"; !x.errb.contains(want) {
+		t.Fatalf("stderr tanpa %q:\n%s", want, x.errb)
+	}
+	if code := x.stop(t); code != 0 {
+		t.Fatalf("kode %d\n%s", code, x.errb)
+	}
+	if _, deletes, _ := h.p.tunnelState(); len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus: %v", deletes)
+	}
+}
+
+// TestExposeAgentURLBerikutnyaDivalidasi — C4: agent_url di tiket sambung
+// ulang divalidasi seperti tiket pertama; bukan wss (dan bukan loopback) =
+// berhenti dengan penjelasan, tunnel sementara dihapus.
+func TestExposeAgentURLBerikutnyaDivalidasi(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	g.drop = true
+	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+		if n < 2 {
+			return false
+		}
+		okStatus(w, http.StatusCreated, map[string]any{"ticket": fmt.Sprintf("tt-x-%d", n), "expires_in": 30, "agent_url": "ws://gerbang-lain.contoh.test" + protocol.AgentConnectPath})
+		return true
+	}
+	x := h.startExpose(t, localApp(t))
+	if code := x.wait(t); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, x.errb)
+	}
+	if !x.errb.contains("easyrun: tunnel berhenti: agent_url dari server harus wss") {
+		t.Fatalf("stderr:\n%s", x.errb)
+	}
+	n, deletes, _ := h.p.tunnelState()
+	if n != 2 {
+		t.Fatalf("permintaan tiket = %d, mau berhenti di tiket kedua", n)
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("tunnel sementara harus dihapus: %v", deletes)
+	}
+}
+
+// TestExposeNamaKosongDitolak — C5: --name yang diberikan tetapi kosong
+// (atau hanya spasi) = galat pemakaian, bukan tunnel acak.
+func TestExposeNamaKosongDitolak(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	// Pengaman: bila validasinya hilang, pembuatan ditolak cepat (kode 1).
+	h.p.tun.createFail = func(w http.ResponseWriter) bool {
+		failReason(w, http.StatusForbidden, "akses tunnel tenant dimatikan", api.ReasonTunnelNotAllowed)
+		return true
+	}
+	for _, args := range [][]string{
+		{"--name", "", "3000"},
+		{"--name", "   ", "3000"},
+		{"--name=", "3000"},
+		{"3000", "--name", "\t"},
+	} {
+		code := h.run(append([]string{"expose"}, args...)...)
+		if code != 2 || !strings.Contains(h.stderr.String(), "--name") {
+			t.Errorf("expose %q: kode %d, mau 2 dengan pesan --name\n%s", args, code, h.stderr)
+		}
+	}
+	if n := h.p.n("POST /api/v1/cli/tunnels"); n != 0 {
+		t.Fatalf("--name kosong tidak boleh membuat tunnel: %d", n)
+	}
+}
+
+// TestExposeBantuanSetelahPort — C6: -h/--help di mana pun (mis. setelah
+// <port>) mencetak bantuan Indonesia yang sama dengan `easyrun expose
+// --help`, exit 0, tanpa usage Inggris paket flag.
+func TestExposeBantuanSetelahPort(t *testing.T) {
+	h := newHarness(t)
+	if code := h.run("expose", "--help"); code != 0 {
+		t.Fatalf("kode %d", code)
+	}
+	want := h.stdout.String()
+	for _, args := range [][]string{{"3000", "-h"}, {"3000", "--help"}, {"--name", "demo", "-help"}, {"-h", "3000"}} {
+		code := h.run(append([]string{"expose"}, args...)...)
+		if code != 0 || h.stdout.String() != want || h.stderr.Len() != 0 {
+			t.Errorf("expose %q: kode %d\nstdout:\n%s\nstderr:\n%s", args, code, h.stdout, h.stderr)
+		}
+	}
+	if code := h.run("expose", "--bogus", "3000"); code != 2 || strings.Contains(h.stderr.String(), "Usage of") || !strings.Contains(h.stderr.String(), "Pemakaian: easyrun expose") {
+		t.Fatalf("opsi salah: kode %d\n%s", code, h.stderr)
+	}
+}
+
+// TestWarnLocalDownDiamSaatBerhenti — C10: Ctrl-C saat memeriksa aplikasi
+// lokal bukan "belum ada aplikasi".
+func TestWarnLocalDownDiamSaatBerhenti(t *testing.T) {
+	h := newHarness(t)
+	x := exposeArgs{host: "127.0.0.1", port: closedLoopbackPort(t)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.a.warnLocalDown(ctx, x)
+	if h.stderr.Len() != 0 {
+		t.Fatalf("peringatan palsu setelah berhenti:\n%s", h.stderr)
+	}
+	h.a.warnLocalDown(context.Background(), x)
+	if !strings.Contains(h.stderr.String(), "belum ada aplikasi di 127.0.0.1:"+x.port) {
+		t.Fatalf("kontrol: peringatan harus tetap ada saat berjalan:\n%s", h.stderr)
+	}
+}
+
+// ---------- E2E lokal: akun diblokir, saklar tunnel mati ----------
+
+// bannedMsg — pesan 401 middleware RejectBanned panel.
+const bannedMsg = "akun Anda diblokir"
+
+// bannedReply — 401 RejectBanned: panel baru menambah data.reason
+// user_banned; panel lama hanya pesannya.
+func bannedReply(withReason bool) func(http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		if withReason {
+			failReason(w, http.StatusUnauthorized, bannedMsg, "user_banned")
+			return
+		}
+		fail(w, http.StatusUnauthorized, bannedMsg)
+	}
+}
+
+// TestExplainAkunDiblokir — 401 user_banned (atau pesan persis panel lama)
+// = kalimat CLI sendiri: akun diblokir, hubungi admin; tanpa saran login.
+// 401 lain tetap menyuruh login.
+func TestExplainAkunDiblokir(t *testing.T) {
+	for _, e := range []*api.Error{
+		{Status: 401, Message: bannedMsg, Reason: "user_banned"},
+		{Status: 401, Message: "pesan lain", Reason: "user_banned"},
+		{Status: 401, Message: bannedMsg},
+	} {
+		got := explain(fmt.Errorf("x: %w", e))
+		if !strings.Contains(got, "akun ini diblokir di EasyRun") || !strings.Contains(got, "hubungi admin") || strings.Contains(got, "easyrun login") {
+			t.Errorf("%+v: %q", e, got)
+		}
+	}
+	if got := explain(&api.Error{Status: 401, Message: "token CLI sudah dicabut"}); !strings.Contains(got, "easyrun login") {
+		t.Fatalf("401 biasa tetap menyarankan login: %q", got)
+	}
+}
+
+// TestBoxesAkunDiblokir — berlaku untuk semua perintah, bukan hanya tunnel.
+func TestBoxesAkunDiblokir(t *testing.T) {
+	for _, withReason := range []bool{true, false} {
+		h := newHarness(t)
+		h.loggedIn(t)
+		reply := bannedReply(withReason)
+		h.p.authFail = func(w http.ResponseWriter) bool { reply(w); return true }
+		if code := h.run("boxes"); code != 1 {
+			t.Fatalf("kode %d\n%s", code, h.stderr)
+		}
+		if errs := h.stderr.String(); !strings.Contains(errs, "akun ini diblokir di EasyRun") || strings.Contains(errs, "easyrun login") {
+			t.Fatalf("reason=%v stderr:\n%s", withReason, errs)
+		}
+	}
+}
+
+// TestExposeAkunDiblokirBerhenti — 401 user_banned saat tiket pertama
+// maupun setelah tunnel pernah siap = fatal dengan kalimat akun diblokir,
+// tanpa saran login; tunnel sementara tetap dicoba dihapus.
+func TestExposeAkunDiblokirBerhenti(t *testing.T) {
+	for _, afterReady := range []bool{false, true} {
+		for _, withReason := range []bool{true, false} {
+			t.Run(fmt.Sprintf("siap=%v/reason=%v", afterReady, withReason), func(t *testing.T) {
+				h := newHarness(t)
+				h.loggedIn(t)
+				g := newGateway(t, h.p)
+				g.drop = true
+				reply := bannedReply(withReason)
+				h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+					if afterReady && n < 2 {
+						return false
+					}
+					reply(w)
+					return true
+				}
+				x := h.startExpose(t, localApp(t))
+				if code := x.wait(t); code != 1 {
+					t.Fatalf("kode %d, mau 1\n%s", code, x.errb)
+				}
+				errs := x.errb.String()
+				if !strings.Contains(errs, "akun ini diblokir di EasyRun") || strings.Contains(errs, "easyrun login") || strings.Contains(errs, "mencoba lagi") {
+					t.Fatalf("stderr:\n%s", errs)
+				}
+				if _, deletes, _ := h.p.tunnelState(); len(deletes) != 1 {
+					t.Fatalf("tunnel sementara harus dihapus: %v", deletes)
+				}
+			})
+		}
+	}
+}
+
+// TestGatewayRejectTextKonsisten — penolakan tiket 403 bertanda gerbang
+// membawa pesan panel saja (tanpa reason): akun diblokir dan saklar mati
+// dijelaskan dengan kalimat CLI yang sama seperti penolakan panel.
+func TestGatewayRejectTextKonsisten(t *testing.T) {
+	ban := explainTunnel(opTunnelRun, fmt.Errorf("x: %w", &agent.FatalError{Status: 403, Message: "akun diblokir"}))
+	if !strings.Contains(ban, "akun ini diblokir di EasyRun") || ban != explain(&api.Error{Status: 401, Reason: "user_banned"}) {
+		t.Fatalf("akun diblokir lewat gerbang: %q", ban)
+	}
+	off := explainTunnel(opTunnelRun, fmt.Errorf("x: %w", &agent.FatalError{Status: 403, Message: "Tunnel belum tersedia"}))
+	if want := explainTunnel(opTunnelRun, &api.Error{Status: 503, Reason: api.ReasonTunnelDisabled}); off != want {
+		t.Fatalf("saklar mati lewat gerbang: %q, mau %q", off, want)
+	}
+}
+
+// TestExposeSaklarMatiBerhenti — 503 tunnel_disabled pada tiket = berhenti
+// (sebelum maupun sesudah siap), kalimat CLI saklar mati + saran menjalankan
+// lagi nanti, exit 1, tunnel sementara dihapus. Teks mentah panel tidak
+// dicetak, dan tidak ada coba lagi / sambung ulang.
+func TestExposeSaklarMatiBerhenti(t *testing.T) {
+	for _, afterReady := range []bool{false, true} {
+		t.Run(fmt.Sprint("siap=", afterReady), func(t *testing.T) {
+			h := newHarness(t)
+			h.loggedIn(t)
+			g := newGateway(t, h.p)
+			g.drop = true
+			h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+				if afterReady && n < 2 {
+					return false
+				}
+				failReason(w, http.StatusServiceUnavailable, "Tunnel belum tersedia", api.ReasonTunnelDisabled)
+				return true
+			}
+			x := h.startExpose(t, localApp(t))
+			if code := x.wait(t); code != 1 {
+				t.Fatalf("kode %d, mau 1\n%s", code, x.errb)
+			}
+			errs := x.errb.String()
+			if !strings.Contains(errs, "tunnel publik sedang dimatikan di platform — jalankan perintahnya lagi nanti") {
+				t.Fatalf("stderr:\n%s", errs)
+			}
+			// Setelah siap: satu "menyambung ulang" dari putusnya gerbang palsu
+			// (g.drop), lalu tiket 503 langsung menghentikan, tanpa ulang.
+			wantTickets, wantReconnects := 1, 0
+			if afterReady {
+				wantTickets, wantReconnects = 2, 1
+			}
+			if strings.Contains(errs, "Tunnel belum tersedia") || strings.Contains(errs, "mencoba lagi") || strings.Count(errs, "menyambung ulang") != wantReconnects {
+				t.Fatalf("stderr:\n%s", errs)
+			}
+			if n, deletes, _ := h.p.tunnelState(); n != wantTickets || len(deletes) != 1 {
+				t.Fatalf("tiket %d (mau %d), hapus %v", n, wantTickets, deletes)
+			}
+		})
+	}
+}
+
+// TestExposeSaklarMatiHapusDitolak — saklar mati juga menolak DELETE (503
+// tunnel_disabled): pengguna diberi tahu tunnel sementara itu tertinggal
+// dan kapan bisa dihapus.
+func TestExposeSaklarMatiHapusDitolak(t *testing.T) {
+	h := newHarness(t)
+	h.loggedIn(t)
+	g := newGateway(t, h.p)
+	g.drop = true
+	h.p.tun.ticketFail = func(w http.ResponseWriter, n int) bool {
+		if n < 2 {
+			return false
+		}
+		failReason(w, http.StatusServiceUnavailable, "Tunnel belum tersedia", api.ReasonTunnelDisabled)
+		return true
+	}
+	h.p.tun.deleteFail = func(w http.ResponseWriter) bool {
+		failReason(w, http.StatusServiceUnavailable, "Tunnel belum tersedia", api.ReasonTunnelDisabled)
+		return true
+	}
+	x := h.startExpose(t, localApp(t))
+	if code := x.wait(t); code != 1 {
+		t.Fatalf("kode %d, mau 1\n%s", code, x.errb)
+	}
+	if !x.errb.contains("easyrun: catatan: tunnel sementara acak-1 tidak bisa dihapus selama tunnel publik dimatikan di platform; hapus setelah dinyalakan lagi: easyrun tunnels rm acak-1") {
+		t.Fatalf("stderr:\n%s", x.errb)
+	}
 }

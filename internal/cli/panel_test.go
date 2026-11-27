@@ -70,6 +70,9 @@ type fakePanel struct {
 	wsHeaders    []http.Header
 	// tun — rute tunnel publik (expose_test.go).
 	tun *fakeTunnels
+	// authFail — penolakan middleware setelah token sah (mis. RejectBanned);
+	// true = sudah dijawab.
+	authFail func(http.ResponseWriter) bool
 }
 
 func ok(w http.ResponseWriter, data any) {
@@ -170,6 +173,12 @@ func (p *fakePanel) auth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+testToken {
 			fail(w, 401, "token CLI tidak berlaku")
+			return
+		}
+		p.mu.Lock()
+		af := p.authFail
+		p.mu.Unlock()
+		if af != nil && af(w) {
 			return
 		}
 		h(w, r)

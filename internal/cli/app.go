@@ -58,6 +58,9 @@ type App struct {
 	// (uji); 0 = bawaan agen tunnel.
 	ExposeBackoffMin time.Duration
 	ExposeBackoffMax time.Duration
+	// ExposeCreateTimeout — batas POST /cli/tunnels tanpa --name (uji);
+	// 0 = exposeCreateTimeout.
+	ExposeCreateTimeout time.Duration
 	// StopSignals — kembalikan perilaku bawaan Ctrl-C (main memakai
 	// RestoreInterrupt; boleh dipanggil berkali-kali). `expose` memanggilnya
 	// setelah sinyal berhenti pertama, supaya Ctrl-C kedua langsung
@@ -212,8 +215,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		if c.name == args[0] {
 			rest := args[1:]
 			if len(rest) > 0 && (rest[0] == "-h" || rest[0] == "--help") {
-				fmt.Fprintf(a.Stdout, "Pemakaian: easyrun %s\n  %s\n%s", c.usage, c.help, c.more)
-				return 0
+				return a.commandHelp(c)
 			}
 			return c.run(a, ctx, rest)
 		}
@@ -296,6 +298,23 @@ func editDistance(a, b string) int {
 		prev = cur
 	}
 	return prev[len(b)]
+}
+
+// commandHelp — bantuan `easyrun <perintah> --help` ke stdout; kode 0.
+func (a *App) commandHelp(c command) int {
+	fmt.Fprintf(a.Stdout, "Pemakaian: easyrun %s\n  %s\n%s", c.usage, c.help, c.more)
+	return 0
+}
+
+// commandHelpFor — commandHelp untuk perintah bernama name (mis. -h yang
+// ditemukan paket flag di tengah argumen).
+func (a *App) commandHelpFor(name string) int {
+	for _, c := range commands {
+		if c.name == name {
+			return a.commandHelp(c)
+		}
+	}
+	return a.unknown(name)
 }
 
 func (a *App) usageError(c string, msg string) int {
@@ -406,6 +425,27 @@ func explain(err error) string {
 	return err.Error()
 }
 
+// userBannedText — akun diblokir di EasyRun: login ulang tidak menolong,
+// jadi tidak ada saran `easyrun login`.
+const userBannedText = "akun ini diblokir di EasyRun — hubungi admin atau dukungan EasyRun (login ulang tidak membantu)"
+
+// Pesan panel untuk akun diblokir, untuk panel yang belum mengirim
+// data.reason user_banned (pesan middleware RejectBanned), dan pesan yang
+// diteruskan gerbang saat tiket ditolak (403 bertanda, tanpa reason).
+const (
+	panelBannedMessage   = "akun Anda diblokir"
+	gatewayBannedMessage = "akun diblokir"
+)
+
+// isUserBanned — penolakan karena akun diblokir: 401 (atau 403) ber-reason
+// user_banned, atau panel lama dengan pesan persis RejectBanned.
+func isUserBanned(e *api.Error) bool {
+	if e.Status != http.StatusUnauthorized && e.Status != http.StatusForbidden {
+		return false
+	}
+	return e.Reason == api.ReasonUserBanned || strings.TrimSpace(e.Message) == panelBannedMessage
+}
+
 func explainAPI(e *api.Error) string {
 	msg := e.Message
 	with := func(base string) string {
@@ -420,6 +460,8 @@ func explainAPI(e *api.Error) string {
 		retry = fmt.Sprintf(" — coba lagi dalam %d detik", secs)
 	}
 	switch {
+	case isUserBanned(e):
+		return userBannedText
 	case e.Status == http.StatusUnauthorized && e.Handshake:
 		// Jabat tangan WebSocket memakai tiket sekali pakai 30 detik, bukan
 		// token: 401 di sini biasanya tiket kedaluwarsa/terpakai ("tiket SSH

@@ -8,14 +8,20 @@ package cli
 //	   ▼                                   ▼
 //	agent.Run ── WSS (Bearer tiket) ──▶ gerbang ──▶ pengunjung https://<host>
 //	   │ stream yamux ⇄ TCP <host>:<port> aplikasi lokal
+//	   │ agent_url tiket berikutnya berubah → agent.Run dimulai lagi ke sana
 //	   ▼
 //	Ctrl-C ─▶ tunnel sementara dihapus (DELETE /cli/tunnels/:id, upaya terbaik)
+//
+// Kebijakan sambung ada di exposeSession: sebelum tunnel pertama kali siap
+// gagal sesaat dicoba ulang selama anggaran waktu exposeStartBudget,
+// sesudahnya sambung ulang tanpa batas.
 
 import (
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -46,10 +52,14 @@ const (
 	// exposeCleanupTimeout — batas menghapus tunnel sementara setelah Ctrl-C;
 	// upaya terbaik, pengguna tidak boleh menunggu lama.
 	exposeCleanupTimeout = 5 * time.Second
-	// exposeCreateTimeout — batas POST /cli/tunnels. Tanpa --name permintaan
-	// ini sengaja tidak ikut dibatalkan Ctrl-C/SIGTERM (supaya id tunnel
-	// sementara yang sudah disimpan panel tetap diketahui lalu dihapus), jadi
-	// batasnya pendek.
+	// exposeCreateTimeout — batas menunggu jawaban POST /cli/tunnels TANPA
+	// --name SETELAH Ctrl-C/SIGTERM. Permintaan itu sengaja tidak ikut
+	// dibatalkan sinyal (supaya id tunnel sementara yang sudah disimpan panel
+	// tetap diketahui lalu dihapus); sebelum ada sinyal yang berlaku hanya
+	// batas klien biasa (api.RequestTimeout), karena Create panel bisa sah
+	// lebih lama dari ini (tenant terkena batas: cek keanggotaan + daftar
+	// sesi gerbang + tulis activity). Dengan --name juga batas klien biasa,
+	// dan Ctrl-C membatalkannya.
 	exposeCreateTimeout = 10 * time.Second
 	// exposeHintTimeout — batas mengambil daftar tunnel untuk petunjuk
 	// tambahan setelah penolakan (upaya terbaik).
@@ -63,17 +73,38 @@ const (
 	// fallbackPublicScheme — skema alamat publik bila gerbang maupun panel
 	// tidak menyebutnya.
 	fallbackPublicScheme = "https"
+	// exposeStartBudget — anggaran WAKTU menyambung sebelum tunnel pertama
+	// kali siap, dihitung sejak permintaan tiket pertama. Selama itu gagal
+	// sesaat (tiket 429/5xx/jaringan, gerbang tak terjangkau atau sedang
+	// restart/deploy) dicoba ulang dengan jeda backoff/Retry-After yang
+	// dipangkas ke sisa anggaran; habis = berhenti dengan alamat dan
+	// sebabnya. Cukup untuk gerbang satu replika yang sedang restart.
+	// Penolakan tiket 401 bertanda gerbang tetap berhenti setelah
+	// agent.DefaultMaxTicketRejects+1 kali berturut-turut ("ulangi
+	// perintahnya"), sama dengan agen; bila anggaran habis lebih dulu, pesan
+	// akhirnya memakai penjelasan yang sama.
+	exposeStartBudget = 60 * time.Second
+	// agentTicketRejectedPrefix — awal Error() penolakan tiket 401 bertanda
+	// gerbang di modul agen v0.1.0 ("gerbang menolak tiket (<status>):
+	// <pesan>"). Tipenya (ticketRejectedError) tidak diekspor, jadi tidak bisa
+	// diperiksa dengan errors.As; TestExposeGerbangTiketTidakValid dan
+	// TestExposeAnggaranHabisSaatGerbangTolakTiket menjaga kecocokannya
+	// dengan modul sungguhan.
+	agentTicketRejectedPrefix = "gerbang menolak tiket ("
 )
 
-const exposeMore = `  --name NAMA       tunnel bernama (tetap ada setelah berhenti, dipakai ulang lain kali);
+// exposeMore — var, bukan const: anggaran waktu diambil dari
+// exposeStartBudget.
+var exposeMore = `  --name NAMA       tunnel bernama (tetap ada setelah berhenti, dipakai ulang lain kali);
                     tanpa --name: nama acak, tunnel dihapus saat berhenti
   --host HOST       alamat aplikasi lokal (bawaan ` + defaultExposeHost + `: ::1 dan 127.0.0.1 dicoba,
                     jadi dev server yang hanya listen di ::1 ikut terjangkau)
   --rewrite-host    ganti header Host menjadi HOST:PORT sebelum sampai ke aplikasi
                     (dev server seperti Vite menolak host asing)
-  Alamat publik dicetak begitu tunnel siap. Sambungan yang putus disambung ulang
-  otomatis. Ctrl-C (atau SIGTERM) untuk berhenti; Ctrl-C kedua keluar paksa
-  tanpa menunggu pembersihan.
+  Alamat publik dicetak begitu tunnel siap. Sebelum siap, gagal menyambung dicoba
+  ulang selama maks. ` + strconv.Itoa(int(exposeStartBudget/time.Second)) + ` detik; setelah pernah siap, sambungan yang putus
+  disambung ulang otomatis tanpa batas. Ctrl-C (atau SIGTERM) untuk berhenti;
+  Ctrl-C kedua keluar paksa tanpa menunggu pembersihan.
   Berjalan di latar (belum ada --detach): pakai tmux/screen, mis.
     tmux new -d -s tunnel 'easyrun expose 3000 --name demo'
   atau nohup (tetap jalan setelah terminal ditutup), mis.
@@ -81,7 +112,7 @@ const exposeMore = `  --name NAMA       tunnel bernama (tetap ada setelah berhen
   lalu hentikan dengan kill <pid> (SIGTERM) — tunnel sementara tetap dihapus.
 `
 
-const tunnelsMore = `  tanpa argumen   tabel tunnel di tenant-tenant kamu
+const tunnelsMore = `  tanpa argumen   tabel tunnel tenant token CLI ini (tenant yang aktif saat login disetujui)
   rm <nama>       hapus tunnel (nama atau id dari tabel); alamatnya langsung tidak berlaku
 `
 
@@ -99,14 +130,21 @@ func (x exposeArgs) localAddr() string { return net.JoinHostPort(x.host, x.port)
 func (a *App) parseExposeArgs(args []string) (exposeArgs, int, bool) {
 	x := exposeArgs{host: defaultExposeHost}
 	fs := flag.NewFlagSet("expose", flag.ContinueOnError)
-	fs.SetOutput(a.Stderr)
+	// Pesan paket flag (usage bahasa Inggris) tidak dicetak: -h/--help di
+	// mana pun = bantuan yang sama dengan `easyrun expose --help`, opsi
+	// salah = galat pemakaian biasa.
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	fs.StringVar(&x.name, "name", "", "nama tunnel")
 	fs.StringVar(&x.host, "host", defaultExposeHost, "alamat aplikasi lokal")
 	fs.BoolVar(&x.rewriteHost, "rewrite-host", false, "ganti header Host menjadi HOST:PORT")
 	var pos []string
 	for {
 		if err := fs.Parse(args); err != nil {
-			return x, 2, false
+			if errors.Is(err, flag.ErrHelp) {
+				return x, a.commandHelpFor("expose"), false
+			}
+			return x, a.usageError("expose", api.Clean(err.Error())), false
 		}
 		if fs.NArg() == 0 {
 			break
@@ -137,7 +175,15 @@ func (a *App) parseExposeArgs(args []string) (exposeArgs, int, bool) {
 	if x.rewriteHost && !protocol.ValidHostRewrite(x.localAddr()) {
 		return x, a.usageError("expose", fmt.Sprintf("--host %q tidak bisa dipakai dengan --rewrite-host: hanya huruf, angka, titik, tanda hubung, atau alamat IP tanpa zona (%%)", api.Clean(x.host))), false
 	}
+	// --name yang diberikan tetapi kosong (mis. variabel shell kosong) bukan
+	// "tanpa --name": itu akan diam-diam membuat tunnel acak yang dihapus saat
+	// berhenti.
+	named := false
+	fs.Visit(func(f *flag.Flag) { named = named || f.Name == "name" })
 	x.name = strings.TrimSpace(x.name)
+	if named && x.name == "" {
+		return x, a.usageError("expose", "--name tidak boleh kosong (tanpa --name: nama acak, tunnel sementara)"), false
+	}
 	return x, 0, true
 }
 
@@ -160,24 +206,52 @@ func (a *App) cmdExpose(ctx context.Context, args []string) int {
 	// tertangkap (zsh mengirim dua SIGHUP saat jendela ditutup).
 	defer afterStop(ctx, a.stopSignals)()
 
-	// Tanpa --name permintaan buat tidak ikut dibatalkan Ctrl-C/SIGTERM: bila
-	// panel sudah menyimpan tunnel sementara, id-nya harus diketahui supaya
-	// bisa dihapus — penggunanya diberi tahu sedang menunggu. Dengan --name
-	// tunnel tetap ada setelah berhenti, jadi tidak ada yang perlu ditunggu.
-	parent, waitNote := ctx, func() {}
-	if x.name == "" {
-		parent = context.WithoutCancel(ctx)
-		waitNote = afterStop(ctx, func() {
-			a.stopSignals() // sebelum pesannya: Ctrl-C kedua sudah keluar paksa
-			fmt.Fprintf(a.Stderr, "\neasyrun: berhenti — menunggu jawaban panel (maks %d detik) supaya tunnel sementara yang terlanjur dibuat bisa dihapus; Ctrl-C sekali lagi untuk keluar paksa.\n",
-				int(exposeCreateTimeout/time.Second))
-		})
+	tun, created, code, ok := a.createExposeTunnel(ctx, c, x)
+	if !ok {
+		return code
 	}
-	cctx, cancel := context.WithTimeout(parent, exposeCreateTimeout)
-	tun, created, err := c.CreateTunnel(cctx, x.name)
-	cancel()
-	waitNote()
-	if err != nil {
+	// Hanya tunnel sementara yang DIBUAT perintah ini (201 + ephemeral) yang
+	// dihapus saat berhenti (Ctrl-C, SIGTERM, ditolak, galat), supaya tidak
+	// memakan jatah tunnel tenant. 200 = tunnel yang sudah ada, bukan milik
+	// perintah ini: tidak pernah dihapus apa pun isi field lainnya (panel
+	// sendiri tidak pernah menjawab 200 untuk tunnel sementara — namanya
+	// 409 tunnel_name_taken). Syarat ephemeral menjaga tunnel bernama yang
+	// baru dibuat (201) tetap ada.
+	owned := created && tun.Ephemeral
+	if owned {
+		defer a.dropEphemeral(c, tun)
+	}
+	if !created {
+		fmt.Fprintf(a.Stderr, "easyrun: memakai tunnel %s yang sudah ada (dibuat %s).\n", dash(tun.Name), createdAt(tun.CreatedAt))
+		a.warnTunnelInUse(tun)
+	}
+	if ctx.Err() != nil {
+		return a.exposeStopped()
+	}
+	s := &exposeSession{a: a, c: c, tun: tun, x: x}
+	if code, ok := s.firstTicket(ctx); !ok {
+		return code
+	}
+	a.warnLocalDown(ctx, x)
+	return s.run(ctx, owned)
+}
+
+// createExposeTunnel — POST /cli/tunnels. ok=false → keluar dengan code.
+//
+// Dengan --name: batas klien biasa (api.RequestTimeout), dan Ctrl-C
+// membatalkannya — tunnel bernama tetap ada setelah berhenti, jadi tidak ada
+// yang perlu ditunggu.
+//
+// Tanpa --name permintaan TIDAK ikut dibatalkan Ctrl-C/SIGTERM: bila panel
+// sudah menyimpan tunnel sementara, id-nya harus diketahui supaya bisa
+// dihapus. Selama pengguna tidak berhenti, yang berlaku hanya batas klien
+// biasa (Create panel bisa sah lama). Setelah sinyal berhenti, jawaban
+// ditunggu paling lama exposeCreateTimeout lagi (penggunanya diberi tahu).
+// Batas mana pun yang habis = tunnel sementara mungkin sudah terbuat tanpa
+// id yang diketahui, jadi pengguna diberi tahu cara memeriksa dan
+// menghapusnya (tidak ada pembersihan otomatis); exit 1.
+func (a *App) createExposeTunnel(ctx context.Context, c *api.Client, x exposeArgs) (tun *api.Tunnel, created bool, code int, ok bool) {
+	failed := func(err error) int {
 		if ctx.Err() != nil {
 			return a.exposeStopped()
 		}
@@ -185,55 +259,395 @@ func (a *App) cmdExpose(ctx context.Context, args []string) int {
 		a.hintDisabledTunnels(ctx, c, err)
 		return code
 	}
-	// Hanya tunnel sementara yang DIBUAT perintah ini (201) yang dihapus saat
-	// berhenti (Ctrl-C, SIGTERM, ditolak, galat), supaya tidak memakan jatah
-	// tunnel tenant. 200 = tunnel yang sudah ada — bisa sedang dipakai sesi
-	// lain, jadi dibiarkan.
-	owned := created && tun.Ephemeral
-	if owned {
-		defer a.dropEphemeral(c, tun)
-	}
-	if !created {
-		fmt.Fprintf(a.Stderr, "easyrun: memakai tunnel %s yang sudah ada (dibuat %s).\n", dash(tun.Name), createdAt(tun.CreatedAt))
-	}
-	if ctx.Err() != nil {
-		return a.exposeStopped()
-	}
-
-	// Tiket pertama diminta di sini karena alamat gerbang (agent_url) ikut
-	// di jawabannya. Gagal di awal = berhenti dengan penjelasan; mencoba
-	// ulang hanya berlaku setelah tunnel pernah berjalan.
-	first, err := c.TunnelTicket(ctx, tun.ID)
-	if err != nil {
-		if ctx.Err() != nil {
-			return a.exposeStopped()
+	if x.name != "" {
+		tun, created, err := c.CreateTunnel(ctx, x.name)
+		if err != nil {
+			return nil, false, failed(err), false
 		}
-		return a.failTunnel("meminta tiket tunnel", opTunnelTicket, err)
+		return tun, created, 0, true
 	}
-	connectURL, err := tunnel.ValidateWSURL("agent_url", first.AgentURL, c.BaseURL)
+	limit := a.exposeCreateTimeout()
+	cctx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	defer cancel(nil)
+	var giveUp *time.Timer
+	waitNote := afterStop(ctx, func() {
+		a.stopSignals() // sebelum pesannya: Ctrl-C kedua sudah keluar paksa
+		fmt.Fprintf(a.Stderr, "\neasyrun: berhenti — menunggu jawaban panel (maks %d detik) supaya tunnel sementara yang terlanjur dibuat bisa dihapus; Ctrl-C sekali lagi untuk keluar paksa.\n", ceilSeconds(limit))
+		giveUp = time.AfterFunc(limit, func() { cancel(errCreateStopWait) })
+	})
+	tun, created, err := c.CreateTunnel(cctx, "")
+	waitNote() // sesudahnya giveUp tidak ditulis lagi
+	if giveUp != nil {
+		giveUp.Stop()
+	}
 	if err != nil {
-		return a.fail("tunnel", err)
+		switch {
+		case errors.Is(context.Cause(cctx), errCreateStopWait):
+			return nil, false, a.createNoAnswer(limit), false
+		case errors.Is(err, api.ErrTimeout):
+			return nil, false, a.createNoAnswer(a.httpTimeout()), false
+		}
+		return nil, false, failed(err), false
 	}
+	return tun, created, 0, true
+}
 
-	a.warnLocalDown(ctx, x)
+// errCreateStopWait — sebab dibatalkannya POST /cli/tunnels tanpa --name:
+// batas tunggu exposeCreateTimeout setelah Ctrl-C/SIGTERM habis.
+var errCreateStopWait = errors.New("panel tidak menjawab setelah berhenti")
+
+// createNoAnswer — POST /cli/tunnels tanpa --name tidak dijawab dalam
+// batasnya: tunnel sementara mungkin sudah terbuat tanpa id yang diketahui.
+func (a *App) createNoAnswer(limit time.Duration) int {
+	fmt.Fprintf(a.Stderr, "easyrun: membuat tunnel: panel tidak menjawab dalam %d detik; tunnel sementara mungkin sudah terbuat — cek dengan: easyrun tunnels, lalu hapus bila ada: easyrun tunnels rm <nama>\n", ceilSeconds(limit))
+	return 1
+}
+
+// httpTimeout — batas klien HTTP yang dipakai (api.RequestTimeout bawaan).
+func (a *App) httpTimeout() time.Duration {
+	if a.HTTP != nil && a.HTTP.Timeout > 0 {
+		return a.HTTP.Timeout
+	}
+	return api.RequestTimeout
+}
+
+func ceilSeconds(d time.Duration) int { return int(math.Ceil(d.Seconds())) }
+
+// warnTunnelInUse — panel menandai tunnel bernama yang dipakai ulang masih
+// aktif (field aditif `active`: sesi terakhirnya belum dicap putus dan tanda
+// hidupnya baru). Gerbang mengganti sesi lama dengan yang baru, jadi dua
+// `expose --name` yang sama di dua tempat saling memutus tanpa henti. Hanya
+// peringatan: tetap menyambung. Panel lama tanpa field ini = tanpa
+// peringatan.
+func (a *App) warnTunnelInUse(tun *api.Tunnel) {
+	if tun.Active == nil || !*tun.Active {
+		return
+	}
+	when := ""
+	if t, ok := localTime(tun.LastSeenAt); ok {
+		when = " (terakhir aktif " + t + ")"
+	}
+	fmt.Fprintf(a.Stderr, "easyrun: peringatan: tunnel %s tampaknya sedang dipakai sesi lain%s. Kalau sesi itu masih jalan, keduanya akan saling memutus — hentikan salah satunya.\n",
+		dash(tun.Name), when)
+}
+
+// exposeCreateTimeout — App.ExposeCreateTimeout bila diisi (uji).
+func (a *App) exposeCreateTimeout() time.Duration {
+	if a.ExposeCreateTimeout > 0 {
+		return a.ExposeCreateTimeout
+	}
+	return exposeCreateTimeout
+}
+
+// exposeBackoff — jeda awal dan maksimum percobaan sebelum tunnel siap
+// (startRetry): sama dengan bawaan agen (Config.fill), supaya jeda sebelum
+// dan sesudah siap serupa.
+func (a *App) exposeBackoff() (lo, hi time.Duration) {
+	lo, hi = a.ExposeBackoffMin, a.ExposeBackoffMax
+	if lo <= 0 {
+		lo = agent.DefaultBackoffMin
+	}
+	if hi < lo {
+		hi = max(agent.DefaultBackoffMax, lo)
+	}
+	return lo, hi
+}
+
+// errGatewayMoved — sebab berhentinya agent.Run: agent_url tiket berikutnya
+// menunjuk gerbang lain (exposeSession.nextTicket).
+var errGatewayMoved = errors.New("panel memindahkan tunnel ke gerbang lain")
+
+// startRetryError — sebab berhentinya agent.Run sebelum tunnel pernah siap:
+// percobaan gagal; jeda dan batasnya diatur exposeSession.startRetry, bukan
+// agen. err = galat percobaan itu.
+type startRetryError struct{ err error }
+
+func (e *startRetryError) Error() string { return e.err.Error() }
+func (e *startRetryError) Unwrap() error { return e.err }
+
+// exposeSession — menyambungkan tunnel yang sudah dibuat/diambil ke gerbang.
+//
+//	firstTicket ─▶ agent.Run(gerbang) ─┬─ OnReady: siap (sekali = selamanya)
+//	  ▲  ▲ belum siap: startRetry       ├─ OnDisconnect: belum siap → Run
+//	  │  │ (jeda ≤ sisa anggaran)       │  dihentikan, startRetry, Run lagi
+//	  └──┴─ exposeStartBudget           └─ Ticket: agent_url berubah → Run
+//	                                       dihentikan, dimulai lagi ke
+//	                                       gerbang baru dengan tiket itu
+//
+// Sebelum tunnel pernah siap, gagal sesaat (tiket 429/5xx/jaringan, gerbang
+// tak terjangkau atau sedang restart, DNS salah) dicoba ulang oleh CLI
+// sendiri selama anggaran WAKTU exposeStartBudget sejak permintaan tiket
+// pertama. Jedanya backoff (bawaan agen) atau Retry-After, dipangkas ke sisa
+// anggaran, lewat App.Sleep; agent.Run dihentikan di setiap kegagalan lalu
+// dimulai lagi, karena jeda internal agen tidak bisa dipangkas. Anggaran
+// habis = berhenti dengan alamat dan sebabnya (exit 1; tunnel sementara
+// buatan sendiri dihapus oleh defer cmdExpose). Penolakan pasti panel/gerbang
+// tetap langsung berhenti. Karena agent.Run dimulai lagi, hitungan
+// penolakan tiket 401 milik agen ikut mulai lagi, jadi CLI menghitungnya
+// sendiri dengan aturan agen (agent.DefaultMaxTicketRejects). Setelah pernah
+// siap, sambung ulang tanpa batas oleh agent.Run.
+//
+// Modul agen tidak bisa mengganti ConnectURL saat berjalan, jadi gerbang
+// baru = agent.Run baru. Pada saat itu sesi lama sudah putus (tiket hanya
+// diminta untuk menyambung), jadi tidak ada sambungan yang ikut terpotong.
+//
+// Semua callback (Ticket, OnReady, OnDisconnect) dipanggil di goroutine
+// agent.Run = goroutine run, jadi field-nya tidak perlu kunci.
+type exposeSession struct {
+	a   *App
+	c   *api.Client
+	tun *api.Tunnel
+	x   exposeArgs
+
+	gateway   *url.URL  // agent_url tervalidasi yang sedang dipakai
+	pending   string    // tiket yang sudah diminta, belum dipakai
+	notBefore time.Time // Retry-After 429 tiket terakhir
+	// ready — tunnel pernah siap (OnReady), termasuk di gerbang sebelumnya.
+	ready bool
+	// startAt — permintaan tiket pertama (awal exposeStartBudget).
+	startAt time.Time
+	// backoff, backoffMax — jeda percobaan berikutnya sebelum siap.
+	backoff, backoffMax time.Duration
+	// rejects — penolakan tiket 401 bertanda gerbang berturut-turut sebelum
+	// siap (tidak direset galat lain; aturan agen).
+	rejects int
+	// ticketFailed — percobaan terakhir gagal di permintaan tiket (panel),
+	// bukan di gerbang.
+	ticketFailed bool
+	stopRun      context.CancelCauseFunc
+}
+
+// firstTicket — tiket pertama, beserta alamat gerbang (agent_url).
+// Penolakan pasti panel dan agent_url yang tidak sah langsung berhenti; gagal
+// sesaat dicoba ulang (startRetry). ok=false → keluar dengan code.
+func (s *exposeSession) firstTicket(ctx context.Context) (code int, ok bool) {
+	s.startAt = s.a.Now()
+	s.backoff, s.backoffMax = s.a.exposeBackoff()
+	for {
+		t, err := s.c.TunnelTicket(ctx, s.tun.ID)
+		if ctx.Err() != nil {
+			return s.a.exposeStopped(), false
+		}
+		if err == nil {
+			u, err := tunnel.ValidateWSURL("agent_url", t.AgentURL, s.c.BaseURL)
+			if err != nil {
+				return s.a.fail("tunnel", err), false
+			}
+			s.gateway, s.pending = u, t.Ticket
+			return 0, true
+		}
+		var fe *agent.FatalError
+		if errors.As(ticketError(err), &fe) {
+			return s.a.failTunnel("meminta tiket tunnel", opTunnelTicket, err), false
+		}
+		s.ticketFailed = true
+		if d := ticketRetryAfter(err); d > 0 {
+			s.notBefore = s.a.Now().Add(d)
+		}
+		if code, ok := s.startRetry(ctx, err); !ok {
+			return code, false
+		}
+	}
+}
+
+// run — agent.Run ke gerbang saat ini; dimulai lagi setelah percobaan yang
+// gagal sebelum siap, atau bila panel memindahkan tunnel ke gerbang lain.
+func (s *exposeSession) run(ctx context.Context, owned bool) int {
+	onReady := s.a.onTunnelReady(s.tun, s.x, owned)
+	for {
+		rctx, stop := context.WithCancelCause(ctx)
+		s.stopRun = stop
+		err := agent.Run(rctx, s.agentConfig(func(r agent.Ready) {
+			s.ready = true
+			onReady(r)
+		}))
+		cause := context.Cause(rctx)
+		stop(nil)
+		if ctx.Err() != nil {
+			return s.a.exposeStopped()
+		}
+		var retry *startRetryError
+		switch {
+		case errors.Is(cause, errGatewayMoved):
+			fmt.Fprintf(s.a.Stderr, "easyrun: panel memindahkan tunnel ke gerbang %s; menyambung ke sana…\n", api.Clean(s.gateway.Host))
+			continue
+		case errors.As(cause, &retry):
+			if code, ok := s.startRetry(ctx, retry.err); !ok {
+				return code
+			}
+			continue
+		}
+		return s.a.failTunnel("tunnel berhenti", opTunnelRun, err)
+	}
+}
+
+func (s *exposeSession) agentConfig(onReady func(agent.Ready)) agent.Config {
 	cfg := agent.Config{
-		ConnectURL:   connectURL.String(),
-		Ticket:       a.ticketSource(c, tun.ID, first.Ticket),
-		LocalAddr:    x.localAddr(),
+		ConnectURL:   s.gateway.String(),
+		Ticket:       s.nextTicket,
+		LocalAddr:    s.x.localAddr(),
 		UserAgent:    userAgent(),
-		BackoffMin:   a.ExposeBackoffMin,
-		BackoffMax:   a.ExposeBackoffMax,
-		OnReady:      a.onTunnelReady(tun, x, owned),
-		OnDisconnect: a.onTunnelDisconnect,
+		BackoffMin:   s.a.ExposeBackoffMin,
+		BackoffMax:   s.a.ExposeBackoffMax,
+		OnReady:      onReady,
+		OnDisconnect: s.onDisconnect,
 	}
-	if x.rewriteHost {
-		cfg.HostRewrite = x.localAddr()
+	if s.x.rewriteHost {
+		cfg.HostRewrite = s.x.localAddr()
 	}
-	err = agent.Run(ctx, cfg)
-	if ctx.Err() != nil {
-		return a.exposeStopped()
+	return cfg
+}
+
+// nextTicket — Config.Ticket: tiket yang sudah diminta (tiket pertama, atau
+// tiket yang dibawa dari gerbang sebelumnya), lalu tiket baru setiap sambung
+// ulang. Penolakan panel yang tidak sembuh dengan mencoba lagi dibungkus
+// *agent.FatalError supaya agen berhenti. agent_url setiap tiket divalidasi
+// seperti tiket pertama; bila menunjuk gerbang lain, agent.Run dihentikan
+// (errGatewayMoved) dan run memulainya lagi ke alamat baru dengan tiket ini.
+func (s *exposeSession) nextTicket(ctx context.Context) (string, error) {
+	s.ticketFailed = false
+	if s.pending != "" {
+		t := s.pending
+		s.pending = ""
+		return t, nil
 	}
-	return a.failTunnel("tunnel berhenti", opTunnelRun, err)
+	// Retry-After dari 429 sebelumnya (hanya setelah pernah siap; sebelum
+	// siap startRetry yang menunggunya, dipangkas ke sisa anggaran): sisa
+	// tunggunya dijalani di sini (jeda agen sudah berjalan lebih dulu, dan
+	// pesan "… dalam …" hanya menyebut jeda itu) — durasi sebenarnya
+	// diumumkan dulu supaya tunnel tidak tampak macet.
+	if wait := s.notBefore.Sub(s.a.Now()); s.ready && wait > 0 {
+		fmt.Fprintf(s.a.Stderr, "easyrun: panel membatasi permintaan tiket tunnel; menunggu %d detik sebelum menyambung ulang…\n",
+			ceilSeconds(wait))
+		if err := s.a.Sleep(ctx, wait); err != nil {
+			return "", err
+		}
+	}
+	t, err := s.c.TunnelTicket(ctx, s.tun.ID)
+	if err != nil {
+		s.ticketFailed = true
+		if d := ticketRetryAfter(err); d > 0 {
+			s.notBefore = s.a.Now().Add(d)
+		}
+		return "", ticketError(err)
+	}
+	u, err := tunnel.ValidateWSURL("agent_url", t.AgentURL, s.c.BaseURL)
+	if err != nil {
+		// Sama dengan tiket pertama: alamat gerbang yang tidak sah dari panel
+		// tidak sembuh dengan mencoba lagi.
+		return "", &panelFatalError{err: err, fatal: &agent.FatalError{Message: err.Error()}}
+	}
+	if u.String() != s.gateway.String() {
+		s.gateway, s.pending = u, t.Ticket
+		s.stopRun(errGatewayMoved)
+		return "", errGatewayMoved
+	}
+	return t.Ticket, nil
+}
+
+// onDisconnect — Config.OnDisconnect. Setelah pernah siap: "terputus,
+// menyambung ulang" (jeda agen). Sebelum siap: agent.Run dihentikan supaya
+// run/startRetry yang menunggu dan menilai anggaran waktu.
+func (s *exposeSession) onDisconnect(err error, retryIn time.Duration) {
+	if s.ready {
+		s.a.onTunnelDisconnect(err, retryIn)
+		return
+	}
+	s.stopRun(&startRetryError{err: err})
+}
+
+// startRetry — satu percobaan gagal sebelum tunnel pernah siap: tunggu lalu
+// coba lagi selama anggaran waktu masih ada. ok=false → berhenti dengan
+// code (penolakan tiket gerbang berulang, anggaran habis, atau dihentikan
+// pengguna).
+func (s *exposeSession) startRetry(ctx context.Context, err error) (code int, ok bool) {
+	if fe, isReject := gatewayTicketRejection(err); isReject {
+		// Aturan agen: penolakan ke-(DefaultMaxTicketRejects+1) berturut-turut
+		// fatal, dengan penjelasan yang sama seperti FatalError agen.
+		if s.rejects++; s.rejects > agent.DefaultMaxTicketRejects {
+			return s.a.failTunnel("tunnel berhenti", opTunnelRun, fe), false
+		}
+	}
+	now := s.a.Now()
+	left := s.startAt.Add(exposeStartBudget).Sub(now)
+	if left <= 0 {
+		return s.startFailed(err), false
+	}
+	d := min(max(s.backoff, s.notBefore.Sub(now)), left)
+	fmt.Fprintf(s.a.Stderr, "easyrun: gagal menyambung tunnel (%s); mencoba lagi dalam %s… (sisa waktu menyambung %d detik)\n",
+		s.startCause(err), d.Round(100*time.Millisecond), ceilSeconds(left))
+	if s.a.Sleep(ctx, d) != nil {
+		return s.a.exposeStopped(), false
+	}
+	s.backoff = min(s.backoff*2, s.backoffMax)
+	return 0, true
+}
+
+// startCause — penjelasan percobaan yang gagal sebelum siap.
+func (s *exposeSession) startCause(err error) string {
+	if s.ticketFailed {
+		return explainTunnel(opTunnelTicket, err)
+	}
+	return api.Clean(explain(err))
+}
+
+// startFailed — anggaran waktu sebelum siap habis: sebut alamat yang gagal
+// (panel bila tiketnya yang gagal, gerbang bila jabat tangannya) dan sebab
+// percobaan terakhir. Penolakan tiket bertanda gerbang dijelaskan sama
+// dengan FatalError agen (gatewayRejectText: "… ulangi perintahnya").
+// Tunnel sementara buatan sendiri dihapus oleh defer cmdExpose.
+func (s *exposeSession) startFailed(err error) int {
+	secs := ceilSeconds(exposeStartBudget)
+	if s.ticketFailed {
+		fmt.Fprintf(s.a.Stderr, "easyrun: gagal menyambung tunnel: panel %s tidak memberi tiket dalam %d detik: %s\n",
+			hostOfURL(s.c.BaseURL), secs, explainTunnel(opTunnelTicket, err))
+		return 1
+	}
+	why := explainTunnel(opTunnelRun, err)
+	if fe, ok := gatewayTicketRejection(err); ok {
+		why = gatewayRejectText(fe)
+	}
+	fmt.Fprintf(s.a.Stderr, "easyrun: gagal menyambung tunnel ke gerbang %s dalam %d detik: %s\n",
+		api.Clean(s.gateway.Host), secs, why)
+	return 1
+}
+
+// gatewayTicketRejection — galat OnDisconnect berupa penolakan tiket 401
+// bertanda gerbang (lihat agentTicketRejectedPrefix), sebagai FatalError
+// yang setara dengan yang dikembalikan agent.Run setelah batas
+// penolakannya.
+func gatewayTicketRejection(err error) (*agent.FatalError, bool) {
+	rest, ok := strings.CutPrefix(err.Error(), agentTicketRejectedPrefix)
+	if !ok {
+		return nil, false
+	}
+	code, msg, ok := strings.Cut(rest, "): ")
+	if !ok {
+		return nil, false
+	}
+	status, cerr := strconv.Atoi(code)
+	if cerr != nil {
+		return nil, false
+	}
+	return &agent.FatalError{Status: status, Message: msg}, true
+}
+
+// ticketRetryAfter — Retry-After 429 permintaan tiket, dipangkas ke
+// maxTicketRetryAfter; 0 bila tidak ada.
+func ticketRetryAfter(err error) time.Duration {
+	var ae *api.Error
+	if errors.As(err, &ae) && ae.Status == http.StatusTooManyRequests && ae.RetryAfter > 0 {
+		return min(ae.RetryAfter, maxTicketRetryAfter)
+	}
+	return 0
+}
+
+// hostOfURL — host[:port] alamat (untuk pesan), dibersihkan.
+func hostOfURL(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return api.Clean(u.Host)
+	}
+	return api.Clean(raw)
 }
 
 // afterStop — jalankan fn (di goroutine) begitu ctx selesai. Kembaliannya
@@ -268,41 +682,6 @@ func (a *App) exposeStopped() int {
 	return 0
 }
 
-// ticketSource — Config.Ticket: tiket pertama yang sudah diminta, lalu tiket
-// baru setiap sambung ulang. Penolakan panel yang tidak sembuh dengan mencoba
-// lagi dibungkus *agent.FatalError supaya agen berhenti.
-func (a *App) ticketSource(c *api.Client, tunnelID, firstTicket string) func(context.Context) (string, error) {
-	pending := firstTicket
-	var notBefore time.Time
-	return func(ctx context.Context) (string, error) {
-		if pending != "" {
-			t := pending
-			pending = ""
-			return t, nil
-		}
-		// Retry-After dari 429 sebelumnya: sisa tunggunya dijalani di sini
-		// (jeda sambung ulang agen sudah berjalan lebih dulu, dan pesan
-		// "menyambung ulang dalam …" hanya menyebut jeda itu) — durasi
-		// sebenarnya diumumkan dulu supaya tunnel tidak tampak macet.
-		if wait := notBefore.Sub(a.Now()); wait > 0 {
-			fmt.Fprintf(a.Stderr, "easyrun: panel membatasi permintaan tiket tunnel; menunggu %d detik sebelum menyambung ulang…\n",
-				int(math.Ceil(wait.Seconds())))
-			if err := a.Sleep(ctx, wait); err != nil {
-				return "", err
-			}
-		}
-		t, err := c.TunnelTicket(ctx, tunnelID)
-		if err != nil {
-			var ae *api.Error
-			if errors.As(err, &ae) && ae.Status == http.StatusTooManyRequests && ae.RetryAfter > 0 {
-				notBefore = a.Now().Add(min(ae.RetryAfter, maxTicketRetryAfter))
-			}
-			return "", ticketError(err)
-		}
-		return t.Ticket, nil
-	}
-}
-
 // panelFatalError — penolakan panel atas permintaan tiket yang tidak akan
 // sembuh dengan mencoba lagi. Membungkus *agent.FatalError (agen berhenti)
 // dan galat aslinya (untuk penjelasan ke pengguna).
@@ -314,14 +693,23 @@ type panelFatalError struct {
 func (e *panelFatalError) Error() string   { return e.err.Error() }
 func (e *panelFatalError) Unwrap() []error { return []error{e.err, e.fatal} }
 
-// ticketError — kontrak F2: 401/403/404/409 fatal; 429, 5xx, dan jaringan
-// dicoba ulang. 4xx lain (selain 408) juga fatal: permintaan yang sama
-// tidak akan diterima dengan mencoba lagi. Pengalihan (3xx) fatal karena
-// token tidak pernah dikirim ke alamat lain.
+// ticketError — penolakan panel atas permintaan tiket. Fatal (sebelum
+// maupun sesudah tunnel siap): 401 (token; termasuk user_banned = akun
+// diblokir), 403 (tunnel_forbidden, tunnel_not_allowed, tunnel_revoked,
+// membership_lost), 404 (tunnel_not_found), dan 503 ber-reason
+// tunnel_disabled (saklar tunnel platform mati = berhenti, bukan menunggu
+// saklar dinyalakan lagi). Dicoba ulang: 429, 5xx lain (termasuk 503 tanpa
+// reason: keanggotaan belum bisa dipastikan, panel bermasalah), dan
+// jaringan. 4xx lain (selain 408) juga fatal walau panel tidak mengirimnya
+// untuk tiket (409 hanya ada di rancangan awal): permintaan yang sama tidak
+// akan diterima dengan mencoba lagi. Pengalihan (3xx) fatal karena token
+// tidak pernah dikirim ke alamat lain.
 func ticketError(err error) error {
 	var ae *api.Error
 	if errors.As(err, &ae) {
-		if ae.Status >= 400 && ae.Status < 500 && ae.Status != http.StatusTooManyRequests && ae.Status != http.StatusRequestTimeout {
+		clientErr := ae.Status >= 400 && ae.Status < 500 && ae.Status != http.StatusTooManyRequests && ae.Status != http.StatusRequestTimeout
+		switchedOff := ae.Status == http.StatusServiceUnavailable && ae.Reason == api.ReasonTunnelDisabled
+		if clientErr || switchedOff {
 			return &panelFatalError{err: err, fatal: &agent.FatalError{Status: ae.Status, Message: ae.Message}}
 		}
 		return err
@@ -360,14 +748,14 @@ func (a *App) onTunnelReady(tun *api.Tunnel, x exposeArgs, dropOnStop bool) func
 			return
 		}
 		fmt.Fprintln(a.Stdout)
-		switch {
-		case dropOnStop:
+		// Tunnel sementara yang tidak dibuat perintah ini tidak mungkin
+		// sampai di sini: panel menjawab nama tunnel sementara dengan 409
+		// tunnel_name_taken, dan tanpa --name selalu 201.
+		if dropOnStop {
 			fmt.Fprintln(a.Stderr, "easyrun: tunnel sementara — dihapus saat berhenti (pakai --name untuk alamat tetap). Ctrl-C untuk berhenti.")
-		case tun.Ephemeral:
-			fmt.Fprintln(a.Stderr, "easyrun: Ctrl-C untuk berhenti; tunnel sementara ini dibuat sesi lain, jadi tidak dihapus di sini.")
-		default:
-			fmt.Fprintln(a.Stderr, "easyrun: Ctrl-C untuk berhenti; tunnel tetap ada (hapus: easyrun tunnels rm "+dash(tun.Name)+").")
+			return
 		}
+		fmt.Fprintln(a.Stderr, "easyrun: Ctrl-C untuk berhenti; tunnel tetap ada (hapus: easyrun tunnels rm "+dash(tun.Name)+").")
 	}
 }
 
@@ -411,6 +799,9 @@ func (a *App) warnLocalDown(ctx context.Context, x exposeArgs) {
 	d := net.Dialer{Timeout: localProbeTimeout}
 	conn, err := d.DialContext(ctx, "tcp", x.localAddr())
 	if err != nil {
+		if ctx.Err() != nil {
+			return // berhenti (Ctrl-C) saat memeriksa, bukan aplikasi yang belum jalan
+		}
 		fmt.Fprintf(a.Stderr, "easyrun: peringatan: belum ada aplikasi di %s; pengunjung melihat halaman galat sampai aplikasinya jalan.\n", x.localAddr())
 		return
 	}
@@ -426,6 +817,13 @@ func (a *App) dropEphemeral(c *api.Client, tun *api.Tunnel) {
 		var ae *api.Error
 		if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
 			return // sudah dihapus (admin, perangkat lain)
+		}
+		// Saklar tunnel platform mati: panel juga menolak DELETE (503
+		// tunnel_disabled), jadi tunnel sementara ini tertinggal sampai
+		// dinyalakan lagi.
+		if errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable && ae.Reason == api.ReasonTunnelDisabled {
+			fmt.Fprintf(a.Stderr, "easyrun: catatan: tunnel sementara %s tidak bisa dihapus selama tunnel publik dimatikan di platform; hapus setelah dinyalakan lagi: easyrun tunnels rm %s\n", dash(tun.Name), dash(tun.Name))
+			return
 		}
 		// Dinonaktifkan admin: tidak bisa dihapus siapa pun selama itu, dan
 		// tidak melayani pengunjung — dianggap selesai, tanpa saran rm.
@@ -467,6 +865,15 @@ func (a *App) hintDisabledTunnels(ctx context.Context, c *api.Client, err error)
 	fmt.Fprintf(a.Stderr, "easyrun: catatan: %d tunnel dinonaktifkan admin EasyRun dan tetap dihitung dalam batas (%s); tunnel itu tidak bisa dihapus — minta admin EasyRun menyalakan atau melepasnya.\n",
 		len(names), strings.Join(names, ", "))
 }
+
+// tunnelDisabledText — saklar tunnel publik platform mati (503
+// tunnel_disabled dari panel, atau pesan panelTunnelDisabledMessage yang
+// diteruskan gerbang): `expose` berhenti, tidak menunggu saklar nyala.
+const tunnelDisabledText = "tunnel publik sedang dimatikan di platform — jalankan perintahnya lagi nanti"
+
+// panelTunnelDisabledMessage — pesan panel saat saklar tunnel mati (503 rute
+// CLI, dan 403 penukaran tiket yang diteruskan gerbang tanpa reason).
+const panelTunnelDisabledMessage = "Tunnel belum tersedia"
 
 // tunnelOp — langkah tunnel yang gagal; satu reason panel bisa berarti lain
 // per langkah (mis. tunnel_forbidden saat membuat vs menghapus).
@@ -532,7 +939,7 @@ func explainTunnel(op tunnelOp, err error) string {
 func tunnelReasonText(op tunnelOp, ae *api.Error) (string, bool) {
 	switch ae.Reason {
 	case api.ReasonTunnelDisabled:
-		return "tunnel publik sedang dimatikan di platform — coba lagi nanti", true
+		return tunnelDisabledText, true
 	case api.ReasonTunnelNotAllowed:
 		return "tunnel publik belum diizinkan untuk tenant ini — minta admin EasyRun menyalakannya", true
 	case api.ReasonTunnelNameInvalid:
@@ -604,8 +1011,15 @@ func gatewayRejectText(fe *agent.FatalError) string {
 		}
 		return s + " — ulangi perintahnya"
 	case http.StatusForbidden:
-		if msg == "" {
+		// Gerbang hanya meneruskan pesan panel (tanpa reason): akun diblokir
+		// dan saklar mati dijelaskan sama dengan penolakan panel langsung.
+		switch msg {
+		case "":
 			return "ditolak gerbang tunnel"
+		case gatewayBannedMessage, panelBannedMessage:
+			return userBannedText
+		case panelTunnelDisabledMessage:
+			return tunnelDisabledText
 		}
 		return "ditolak gerbang tunnel: " + msg
 	}
@@ -649,7 +1063,7 @@ func (a *App) listTunnels(ctx context.Context) int {
 	}
 	sort.SliceStable(ts, func(i, j int) bool { return strings.ToLower(ts[i].Name) < strings.ToLower(ts[j].Name) })
 	tw := tabwriter.NewWriter(a.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAMA\tURL\tSEMENTARA\tSTATUS\tDIBUAT\tID")
+	fmt.Fprintln(tw, "NAMA\tURL\tSEMENTARA\tSTATUS\tTERSAMBUNG\tDIBUAT\tID")
 	for _, t := range ts {
 		eph, status := "tidak", "aktif"
 		if t.Ephemeral {
@@ -658,16 +1072,38 @@ func (a *App) listTunnels(ctx context.Context) int {
 		if t.Disabled {
 			status = "dinonaktifkan"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", dash(t.Name), tunnelURL(t), eph, status, createdAt(t.CreatedAt), dash(t.ID))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", dash(t.Name), tunnelURL(t), eph, status, tunnelConnected(t), createdAt(t.CreatedAt), dash(t.ID))
 	}
 	return boolCode(tw.Flush() == nil)
 }
 
+// tunnelConnected — kolom TERSAMBUNG dari field aditif `active` panel
+// (sesi terakhir belum dicap putus dan tanda hidupnya baru); "-" = panel
+// lama yang belum mengirimnya.
+func tunnelConnected(t api.Tunnel) string {
+	switch {
+	case t.Active == nil:
+		return "-"
+	case *t.Active:
+		return "ya"
+	}
+	return "tidak"
+}
+
 func createdAt(s string) string {
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t.Local().Format(timeLayout)
+	if t, ok := localTime(s); ok {
+		return t
 	}
 	return dash(s)
+}
+
+// localTime — waktu RFC3339 dari panel dalam zona waktu laptop.
+func localTime(s string) (string, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return "", false
+	}
+	return t.Local().Format(timeLayout), true
 }
 
 type tunnelNotFoundError struct{ query string }

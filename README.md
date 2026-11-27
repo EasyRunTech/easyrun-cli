@@ -77,10 +77,9 @@ Barisnya harus di atas karena ssh memakai nilai **pertama** yang ditemukannya un
 | `easyrun tunnel <box>` | ProxyCommand: saluran SSH lewat WebSocket HTTPS panel. Dipanggil `ssh`, bukan untuk diketik. |
 | `easyrun --version`, `--help`, `--self-update` | Versi, bantuan, pembaruan. |
 | `easyrun --config-dir DIR --api-url URL <perintah> …` | Opsi global (sebelum nama perintah), menggantikan `EASYRUN_CONFIG_DIR` / `EASYRUN_API_URL`. |
-
 | `easyrun claude <box> …` | Claude Code di box, berkas & perintah di laptop ini. Lihat [Claude Code di box](#claude-code-di-box-easyrun-claude). |
 | `easyrun expose <port> [--name NAMA] [--host HOST] [--rewrite-host]` | Buka aplikasi lokal ke internet lewat alamat publik https. Lihat [Tunnel publik](#tunnel-publik-easyrun-expose). |
-| `easyrun tunnels [rm <nama>]` | Tabel tunnel publik di tenant-tenant kamu (nama, URL, sementara, status, dibuat, id), atau hapus satu (nama atau id). |
+| `easyrun tunnels [rm <nama>]` | Tabel tunnel publik tenant token CLI ini, yaitu tenant yang aktif saat login disetujui, bukan semua tenant-mu (nama, URL, sementara, status, tersambung, dibuat, id), atau hapus satu (nama atau id). Kolom tersambung berisi `-` bila panel belum mengirim datanya. |
 
 Butuh OpenSSH (`ssh`) di PATH: sudah ada di macOS dan kebanyakan Linux; Windows: fitur "OpenSSH Client".
 
@@ -161,29 +160,32 @@ easyrun expose 3000                          # nama acak, dihapus saat berhenti
 easyrun expose 3000 --name demo              # alamat tetap, dipakai ulang lain kali
 easyrun expose 5173 --rewrite-host           # dev server yang menolak host asing (Vite)
 easyrun expose 8080 --host 192.168.1.20      # aplikasi di mesin lain di jaringan lokal
-easyrun tunnels                              # daftar tunnel
+easyrun tunnels                              # daftar tunnel tenant token CLI ini
 easyrun tunnels rm demo                      # hapus; alamatnya langsung tidak berlaku
 ```
 
 | Opsi | Arti | Bawaan |
 |---|---|---|
 | `<port>` | port aplikasi lokal (1–65535) | wajib |
-| `--name NAMA` | tunnel bernama: tetap ada setelah berhenti; tunnel kamu sendiri dengan nama itu dipakai ulang (easyrun memberi tahu "memakai tunnel … yang sudah ada"). Nama diperiksa panel (huruf kecil, angka, `-`) | nama acak dari panel, tunnel **sementara** |
+| `--name NAMA` | tunnel bernama: tetap ada setelah berhenti; tunnel kamu sendiri dengan nama itu dipakai ulang (easyrun memberi tahu "memakai tunnel … yang sudah ada"). Nama diperiksa panel (huruf kecil, angka, `-`); nama tunnel sementara tidak bisa dipakai. `--name ""` (kosong) ditolak | nama acak dari panel, tunnel **sementara** |
 | `--host HOST` | alamat aplikasi lokal | `localhost`: `::1` dan `127.0.0.1` sama-sama dicoba, jadi dev server yang hanya listen di `::1` (mis. Vite di Node ≥ 17 macOS) maupun aplikasi yang hanya listen di `127.0.0.1` terjangkau |
 | `--rewrite-host` | header `Host` diganti menjadi `HOST:PORT` (tanpa `--host`: `localhost:PORT`) sebelum sampai ke aplikasi. `HOST` di sini hanya boleh huruf, angka, titik, tanda hubung, atau alamat IP tanpa zona (`%`); selain itu ditolak sebelum tunnel dibuat | `Host` asli pengunjung |
 
-Opsi boleh ditulis sebelum atau sesudah `<port>`.
+Opsi boleh ditulis sebelum atau sesudah `<port>`. `-h`/`--help` di posisi mana pun mencetak bantuan `easyrun expose`.
 
 - Alamat publik dicetak (stdout) begitu tunnel siap. Pesan sambung ulang dan catatan lain ke stderr.
-- Sambungan yang putus disambung ulang otomatis dengan jeda yang makin panjang (maks. 30 detik). Setiap sambungan memakai tiket baru dari panel (sekali pakai, berumur pendek); token CLI tidak pernah dikirim ke gerbang.
-- Berhenti tanpa sambung ulang bila panel menolak dengan alasan yang tidak sembuh dengan mencoba lagi (token dicabut, tunnel dihapus atau dinonaktifkan admin, akses tunnel tenant dimatikan). Batas laju (429, dengan `Retry-After`) dan gangguan sesaat (5xx, jaringan) dicoba ulang.
+- Sebelum tunnel pertama kali siap, gangguan sesaat (tiket ditolak 429 dengan `Retry-After`, 5xx, jaringan, gerbang tidak terjangkau atau sedang restart/deploy, DNS salah) dicoba ulang selama maks. 60 detik sejak permintaan tiket pertama. Jedanya makin panjang (atau sesuai `Retry-After`), tetapi tidak melewati sisa waktu itu. Pesannya "gagal menyambung tunnel … (sisa waktu menyambung N detik)". Lewat batas itu easyrun berhenti dengan exit ≠ 0, menyebut alamat yang gagal (panel atau gerbang) beserta sebabnya, dan menghapus tunnel sementara buatannya. Penolakan pasti tetap langsung berhenti.
+- Setelah pernah siap, sambungan yang putus ("tunnel terputus …") disambung ulang otomatis tanpa batas, dengan jeda yang makin panjang (maks. 30 detik). Setiap sambungan memakai tiket baru dari panel (sekali pakai, berumur pendek); token CLI tidak pernah dikirim ke gerbang.
+- Alamat gerbang (`agent_url`) diperiksa di setiap tiket. Bila panel memindahkan tunnel ke gerbang lain, easyrun menyambung ke alamat baru itu ("panel memindahkan tunnel ke gerbang …").
+- Berhenti tanpa sambung ulang (exit ≠ 0), sebelum maupun sesudah tunnel siap, bila panel menolak dengan alasan yang tidak sembuh dengan mencoba lagi: token dicabut, akun diblokir, tunnel dihapus atau dinonaktifkan admin, akses tunnel tenant dimatikan, bukan pembuat/owner tunnel, atau saklar tunnel publik platform dimatikan (503 `tunnel_disabled`: "tunnel publik sedang dimatikan di platform — jalankan perintahnya lagi nanti"; easyrun tidak menunggu saklar dinyalakan). Tunnel sementara buatan perintah ini tetap dicoba dihapus. Saat saklar mati, panel juga menolak penghapusannya, jadi easyrun memberi tahu bahwa tunnel itu tertinggal dan bisa dihapus dengan `easyrun tunnels rm <nama>` setelah saklar dinyalakan lagi. Batas laju (429, dengan `Retry-After`) dan gangguan sesaat (5xx tanpa alasan, jaringan) dicoba ulang.
 - Gerbang yang menolak tiket sambungan (401, mis. tiket kedaluwarsa saat jabat tangan lambat) dicoba ulang dengan tiket baru maksimal 3 kali berturut-turut; bila tetap ditolak, easyrun berhenti dengan saran mengulang perintahnya (bukan `easyrun login`: token CLI tidak pernah dikirim ke gerbang).
-- Ctrl-C atau SIGTERM (mis. `kill <pid>`) menghentikan tunnel dengan rapi; tunnel sementara yang **dibuat perintah ini** dihapus (upaya terbaik, batas 5 detik). Tunnel yang sudah ada sebelumnya (dipakai ulang lewat `--name`) tidak pernah dihapus. Ctrl-C yang jatuh tepat saat tunnel sementara sedang dibuat tetap menunggu jawaban panel (maks. 10 detik, dengan pesan) supaya tunnel itu tidak tertinggal; dengan `--name` tidak ada yang ditunggu. Ctrl-C kedua keluar paksa tanpa menunggu pembersihan. Bila gagal dihapus, easyrun menyebut perintah `easyrun tunnels rm <nama>`-nya — kecuali tunnel itu sedang dinonaktifkan admin (tidak bisa dihapus siapa pun dan tidak melayani pengunjung selama itu).
+- Ctrl-C atau SIGTERM (mis. `kill <pid>`) menghentikan tunnel dengan rapi; tunnel sementara yang **dibuat perintah ini** dihapus (upaya terbaik, batas 5 detik). Tunnel yang sudah ada sebelumnya (dipakai ulang lewat `--name`) tidak pernah dihapus. Ctrl-C yang jatuh tepat saat tunnel sementara sedang dibuat tetap menunggu jawaban panel (maks. 10 detik, dengan pesan) supaya tunnel itu tidak tertinggal; dengan `--name` tidak ada yang ditunggu. Sebelum ada Ctrl-C, pembuatan tunnel sementara hanya dibatasi batas waktu permintaan biasa (30 detik), karena panel bisa sah butuh lebih dari 10 detik. Bila panel tidak menjawab dalam batas itu, atau dalam 10 detik setelah Ctrl-C, easyrun berhenti dengan exit 1 dan memberi tahu bahwa tunnel itu mungkin sudah terbuat; periksa dengan `easyrun tunnels`, lalu hapus dengan `easyrun tunnels rm <nama>` bila ada. Tidak ada pembersihan otomatis untuk kasus ini. Dengan `--name` berlaku batas waktu permintaan biasa. Ctrl-C kedua keluar paksa tanpa menunggu pembersihan. Bila gagal dihapus, easyrun menyebut perintah `easyrun tunnels rm <nama>`-nya — kecuali tunnel itu sedang dinonaktifkan admin (tidak bisa dihapus siapa pun dan tidak melayani pengunjung selama itu).
 - Belum ada `--detach`. Untuk berjalan di latar pakai tmux/screen (`tmux new -d -s tunnel 'easyrun expose 3000 --name demo'`) atau nohup (`nohup easyrun expose 3000 --name demo > expose.log 2>&1 &`; tetap jalan setelah terminal ditutup karena SIGHUP yang diabaikan nohup tidak dipasang ulang), lalu hentikan dengan `kill <pid>`.
 - Bila belum ada aplikasi di `HOST:PORT`, easyrun memperingatkan tetapi tunnel tetap dibuka; pengunjung melihat halaman galat sampai aplikasinya jalan.
-- Alamat gerbang (`agent_url`) dari panel wajib `wss://` (`ws://` hanya ke localhost untuk uji).
+- Alamat gerbang (`agent_url`) dari panel wajib `wss://` (`ws://` hanya ke localhost untuk uji), juga di tiket sambung ulang.
+- Tunnel bernama hanya dilayani satu sesi. Sambungan baru menggantikan sesi lama di gerbang, jadi `easyrun expose --name demo` yang jalan di dua tempat akan saling memutus terus. Bila panel menandai tunnel yang dipakai ulang masih aktif (field `active`, beserta `last_seen_at` bila ada), easyrun mencetak peringatan sebelum menyambung lalu tetap lanjut. Hentikan salah satu sesinya. Panel lama tanpa field ini tidak memicu peringatan.
 
-Tunnel publik belum tersedia untuk semua tenant. Setiap alasan penolakan panel (`data.reason`) dijelaskan dengan kalimat dan langkah berikutnya: tunnel dimatikan di platform (`tunnel_disabled`), belum diizinkan untuk tenant (`tunnel_not_allowed`), nama tidak sah (`tunnel_name_invalid`), nama/alamat sudah dipakai (`tunnel_name_taken`), batas jumlah tunnel tercapai (`tunnel_limit_reached`, dengan petunjuk `easyrun tunnels`; tunnel yang dinonaktifkan admin ikut dihitung dan disebut namanya), tunnel milik anggota lain (`tunnel_forbidden`; owner org menghapusnya lewat panel, karena lewat CLI "owner" hanya berlaku untuk tenant pribadi), dinonaktifkan admin (`tunnel_revoked`), sudah dihapus (`tunnel_not_found`), dan terlalu banyak permintaan (`rate_limited`, dengan lama tunggunya bila disebut panel). Pesan dari panel dan gerbang dibersihkan dari karakter kendali sebelum dicetak.
+Tunnel publik belum tersedia untuk semua tenant. Setiap alasan penolakan panel (`data.reason`) dijelaskan dengan kalimat dan langkah berikutnya: tunnel dimatikan di platform (`tunnel_disabled`; `expose` berhenti), belum diizinkan untuk tenant (`tunnel_not_allowed`), nama tidak sah (`tunnel_name_invalid`), nama/alamat sudah dipakai (`tunnel_name_taken`), batas jumlah tunnel tercapai (`tunnel_limit_reached`, dengan petunjuk `easyrun tunnels`; tunnel yang dinonaktifkan admin ikut dihitung dan disebut namanya), tunnel milik anggota lain (`tunnel_forbidden`; owner org menghapusnya lewat panel, karena lewat CLI "owner" hanya berlaku untuk tenant pribadi), dinonaktifkan admin (`tunnel_revoked`), sudah dihapus (`tunnel_not_found`), dan terlalu banyak permintaan (`rate_limited`, dengan lama tunggunya bila disebut panel). Pesan dari panel dan gerbang dibersihkan dari karakter kendali sebelum dicetak.
 
 ## Yang disimpan, dan di mana
 
@@ -231,8 +233,10 @@ Catatan keamanan:
 | Terlalu sering meminta sertifikat/tiket (429) | kalimat batas laju dari panel + lama tunggu dari `Retry-After` |
 | Saklar SSH platform mati (503 "SSH belum tersedia") | "SSH sedang dimatikan di platform" |
 | Token CLI ditolak saat meminta daftar box, sertifikat, atau tiket (401) | "sesi CLI tidak berlaku (kedaluwarsa atau dicabut) — jalankan: easyrun login" |
+| Akun diblokir di EasyRun (401 `data.reason: user_banned`, atau pesan "akun Anda diblokir" dari panel lama; juga penolakan tiket di gerbang), di semua perintah | "akun ini diblokir di EasyRun — hubungi admin atau dukungan EasyRun (login ulang tidak membantu)", tanpa saran `easyrun login` |
 | Panel menolak saat membuka sambungan (401; biasanya tiket sekali pakai 30 detik sudah kedaluwarsa) | kalimat panel, lalu "ulangi perintahnya; bila tetap gagal, jalankan: easyrun login" |
 | `expose`: gerbang tunnel tetap menolak tiket sambungan (401) setelah dicoba ulang dengan tiket baru | "gerbang tunnel berulang kali menolak tiket sambungan", kalimat gerbang, lalu "ulangi perintahnya" |
+| `expose`: tunnel belum tersambung dalam 60 detik (panel tidak memberi tiket, atau gerbang tidak terjangkau) | "gagal menyambung tunnel: panel … tidak memberi tiket dalam 60 detik: …" atau "gagal menyambung tunnel ke gerbang … dalam 60 detik: …", dengan sebab percobaan terakhir (penolakan tiket gerbang: "… ulangi perintahnya") |
 | Box mengirim galat lewat saluran (mis. image belum mendukung SSH) | kalimatnya apa adanya, tercetak sebelum pesan "Connection closed" milik ssh, dan keluar dengan kode ≠ 0 |
 
 ## Pengembangan

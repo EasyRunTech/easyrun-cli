@@ -55,6 +55,9 @@ const (
 	ReasonRateLimited = "rate_limited"
 	// ReasonSessionLimit — batas sesi SSH bersamaan tercapai.
 	ReasonSessionLimit = "session_limit"
+	// ReasonUserBanned — akun diblokir di EasyRun (401 middleware
+	// RejectBanned panel; aditif, panel lama hanya mengirim pesannya).
+	ReasonUserBanned = "user_banned"
 )
 
 // Alasan penolakan rute tunnel publik (`data.reason`, kontrak F2 tunnel).
@@ -355,6 +358,13 @@ func (c *Client) doStatus(ctx context.Context, method, path string, in, out any,
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			err = ErrTimeout
+		}
 		return nil, 0, &NetError{Host: hostOf(c.BaseURL), Err: err}
 	}
 	if len(raw) > maxBody {
@@ -398,12 +408,17 @@ func hostOf(base string) string {
 	return base
 }
 
+// ErrTimeout — batas waktu permintaan habis (http.Client.Timeout, mis.
+// RequestTimeout) sebelum server menjawab; isi NetError.Err. Pemanggil bisa
+// memeriksanya dengan errors.Is.
+var ErrTimeout = errors.New("batas waktu habis")
+
 func unwrapURLError(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		var ne net.Error
 		if errors.As(ue.Err, &ne) && ne.Timeout() {
-			return errors.New("batas waktu habis")
+			return ErrTimeout
 		}
 		return ue.Err
 	}
@@ -557,6 +572,13 @@ type Tunnel struct {
 	Ephemeral bool   `json:"ephemeral"`
 	Disabled  bool   `json:"disabled"`
 	CreatedAt string `json:"created_at"`
+	// Active — field aditif panel: sesi terakhir tunnel belum dicap putus
+	// dan tanda hidupnya masih baru (menurut panel). nil = panel lama yang
+	// belum mengirimnya (tidak diketahui).
+	Active *bool `json:"active"`
+	// LastSeenAt — tanda hidup terakhir (RFC3339) menurut panel; "" = null
+	// atau panel lama.
+	LastSeenAt string `json:"last_seen_at"`
 }
 
 // TunnelTicket — jawaban POST /cli/tunnels/:id/ticket: tiket sekali pakai
@@ -568,7 +590,8 @@ type TunnelTicket struct {
 }
 
 // CreateTunnel — POST /cli/tunnels. name kosong = nama acak dari panel
-// (tunnel sementara). Nama yang sudah ada di tenant yang sama dipakai ulang.
+// (tunnel sementara). Tunnel BERNAMA yang sudah ada di tenant yang sama
+// dipakai ulang; nama milik tunnel sementara = 409 tunnel_name_taken.
 // created = panel membuat tunnel baru (201); false = tunnel yang sudah ada
 // dikembalikan (200) — tunnel itu bukan milik perintah ini.
 func (c *Client) CreateTunnel(ctx context.Context, name string) (t *Tunnel, created bool, err error) {
@@ -589,7 +612,8 @@ func (c *Client) CreateTunnel(ctx context.Context, name string) (t *Tunnel, crea
 	return out.Tunnel, status == http.StatusCreated, nil
 }
 
-// Tunnels — GET /cli/tunnels: tunnel di tenant-tenant pengguna.
+// Tunnels — GET /cli/tunnels: tunnel tenant token CLI ini saja (tenant yang
+// aktif saat login disetujui), bukan semua tenant pengguna.
 func (c *Client) Tunnels(ctx context.Context) ([]Tunnel, error) {
 	var out struct {
 		Tunnels []Tunnel `json:"tunnels"`
