@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/EasyRunTech/easyrun-cli/internal/api"
 	"github.com/EasyRunTech/easyrun-cli/internal/config"
@@ -53,6 +54,19 @@ type App struct {
 	// TunnelReadyTimeout, TunnelCloseGrace — uji; 0 = bawaan.
 	TunnelReadyTimeout time.Duration
 	TunnelCloseGrace   time.Duration
+	// ExposeBackoffMin, ExposeBackoffMax — jeda sambung ulang `expose`
+	// (uji); 0 = bawaan agen tunnel.
+	ExposeBackoffMin time.Duration
+	ExposeBackoffMax time.Duration
+	// ExposeCreateTimeout — batas POST /cli/tunnels tanpa --name (uji);
+	// 0 = exposeCreateTimeout.
+	ExposeCreateTimeout time.Duration
+	// StopSignals — kembalikan perilaku bawaan Ctrl-C (main memakai
+	// RestoreInterrupt; boleh dipanggil berkali-kali). `expose` memanggilnya
+	// setelah sinyal berhenti pertama, supaya Ctrl-C kedua langsung
+	// menghentikan proses selama pembersihan, sementara SIGTERM/SIGHUP
+	// berikutnya tetap tertangkap. nil = tidak ada.
+	StopSignals func()
 	// GOOS — sistem tujuan untuk cara mengutip path; bawaan runtime.GOOS.
 	GOOS string
 	// Getwd — folder kerja (root `easyrun claude`); nil = os.Getwd.
@@ -110,6 +124,9 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 func userAgent() string { return "easyrun/" + version.Version }
 
+// usageWidth — lebar kolom pemakaian di `easyrun --help`.
+const usageWidth = 30
+
 type command struct {
 	name  string
 	usage string
@@ -133,17 +150,24 @@ func init() {
 		{"ssh-prepare", "ssh-prepare <box>", "perbarui sertifikat SSH bila perlu", "  Dipanggil otomatis oleh blok Match exec dari ssh-config.\n", (*App).cmdSSHPrepare},
 		{"tunnel", "tunnel <box>", "saluran SSH lewat HTTPS (ProxyCommand)", "  Dipanggil ssh sebagai ProxyCommand; stdin/stdout = aliran SSH. Bukan untuk diketik langsung.\n", (*App).cmdTunnel},
 		{"claude", "claude <box> <pane> <aksi>", "Claude Code di box, berkas & perintah di laptop", claudeMore, (*App).cmdClaude},
+		{"expose", "expose <port> [--name NAMA] [--host HOST] [--rewrite-host]", "buka aplikasi lokal ke internet (alamat publik https)", exposeMore, (*App).cmdExpose},
+		{"tunnels", "tunnels [rm <nama>]", "daftar tunnel publik, atau hapus satu", tunnelsMore, (*App).cmdTunnels},
 	}
 }
 
 func (a *App) usage(w io.Writer) {
 	fmt.Fprintf(w, "easyrun %s — program baris perintah EasyRun\n\nPemakaian:\n", version.Version)
 	for _, c := range commands {
-		fmt.Fprintf(w, "  easyrun %-30s %s\n", c.usage, c.help)
+		if utf8.RuneCountInString(c.usage) > usageWidth {
+			// Pemakaian panjang: keterangan di baris berikutnya, tetap sejajar.
+			fmt.Fprintf(w, "  easyrun %s\n  %*s %s\n", c.usage, len("easyrun ")+usageWidth, "", c.help)
+			continue
+		}
+		fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, c.usage, c.help)
 	}
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--version", "tampilkan versi")
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--self-update", "perbarui ke versi terbaru")
-	fmt.Fprintf(w, "  easyrun %-30s %s\n", "--help", "tampilkan bantuan ini")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--version", "tampilkan versi")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--self-update", "perbarui ke versi terbaru")
+	fmt.Fprintf(w, "  easyrun %-*s %s\n", usageWidth, "--help", "tampilkan bantuan ini")
 	fmt.Fprintf(w, `
 <box> = nama, hostname, atau id dari `+"`easyrun boxes`"+`.
 
@@ -153,6 +177,8 @@ Contoh:
   easyrun ssh uji-box -- -L 8080:localhost:8080
   easyrun ssh-config uji-box --write   lalu: ssh uji-box, scp, VS Code
   easyrun claude uji-box w1 attach     claude di box, berkas di folder ini
+  easyrun expose 3000                  alamat publik https untuk port 3000 laptop ini
+  easyrun expose 5173 --name demo --rewrite-host
 
 Opsi global (sebelum nama perintah):
   --config-dir DIR   folder konfigurasi (menggantikan %s)
@@ -189,8 +215,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		if c.name == args[0] {
 			rest := args[1:]
 			if len(rest) > 0 && (rest[0] == "-h" || rest[0] == "--help") {
-				fmt.Fprintf(a.Stdout, "Pemakaian: easyrun %s\n  %s\n%s", c.usage, c.help, c.more)
-				return 0
+				return a.commandHelp(c)
 			}
 			return c.run(a, ctx, rest)
 		}
@@ -273,6 +298,23 @@ func editDistance(a, b string) int {
 		prev = cur
 	}
 	return prev[len(b)]
+}
+
+// commandHelp — bantuan `easyrun <perintah> --help` ke stdout; kode 0.
+func (a *App) commandHelp(c command) int {
+	fmt.Fprintf(a.Stdout, "Pemakaian: easyrun %s\n  %s\n%s", c.usage, c.help, c.more)
+	return 0
+}
+
+// commandHelpFor — commandHelp untuk perintah bernama name (mis. -h yang
+// ditemukan paket flag di tengah argumen).
+func (a *App) commandHelpFor(name string) int {
+	for _, c := range commands {
+		if c.name == name {
+			return a.commandHelp(c)
+		}
+	}
+	return a.unknown(name)
 }
 
 func (a *App) usageError(c string, msg string) int {
@@ -383,6 +425,27 @@ func explain(err error) string {
 	return err.Error()
 }
 
+// userBannedText — akun diblokir di EasyRun: login ulang tidak menolong,
+// jadi tidak ada saran `easyrun login`.
+const userBannedText = "akun ini diblokir di EasyRun — hubungi admin atau dukungan EasyRun (login ulang tidak membantu)"
+
+// Pesan panel untuk akun diblokir, untuk panel yang belum mengirim
+// data.reason user_banned (pesan middleware RejectBanned), dan pesan yang
+// diteruskan gerbang saat tiket ditolak (403 bertanda, tanpa reason).
+const (
+	panelBannedMessage   = "akun Anda diblokir"
+	gatewayBannedMessage = "akun diblokir"
+)
+
+// isUserBanned — penolakan karena akun diblokir: 401 (atau 403) ber-reason
+// user_banned, atau panel lama dengan pesan persis RejectBanned.
+func isUserBanned(e *api.Error) bool {
+	if e.Status != http.StatusUnauthorized && e.Status != http.StatusForbidden {
+		return false
+	}
+	return e.Reason == api.ReasonUserBanned || strings.TrimSpace(e.Message) == panelBannedMessage
+}
+
 func explainAPI(e *api.Error) string {
 	msg := e.Message
 	with := func(base string) string {
@@ -397,6 +460,8 @@ func explainAPI(e *api.Error) string {
 		retry = fmt.Sprintf(" — coba lagi dalam %d detik", secs)
 	}
 	switch {
+	case isUserBanned(e):
+		return userBannedText
 	case e.Status == http.StatusUnauthorized && e.Handshake:
 		// Jabat tangan WebSocket memakai tiket sekali pakai 30 detik, bukan
 		// token: 401 di sini biasanya tiket kedaluwarsa/terpakai ("tiket SSH

@@ -3,7 +3,9 @@ module github.com/EasyRunTech/easyrun-cli
 go 1.25.0
 
 require (
+	github.com/EasyRunTech/easyrun-tunnel-agent v0.1.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/hashicorp/yamux v0.1.2
 	golang.org/x/crypto v0.55.0
 )
 

@@ -68,6 +68,11 @@ type fakePanel struct {
 	ws           func(*websocket.Conn, *http.Request)
 	tickets      map[string]string
 	wsHeaders    []http.Header
+	// tun — rute tunnel publik (expose_test.go).
+	tun *fakeTunnels
+	// authFail — penolakan middleware setelah token sah (mis. RejectBanned);
+	// true = sudah dijawab.
+	authFail func(http.ResponseWriter) bool
 }
 
 func ok(w http.ResponseWriter, data any) {
@@ -127,6 +132,7 @@ func newPanel(t *testing.T) *fakePanel {
 	mux.HandleFunc("POST /api/v1/instances/{id}/ssh/certificate", p.auth(p.handleCert))
 	mux.HandleFunc("POST /api/v1/instances/{id}/ssh/ticket", p.auth(p.handleTicket))
 	mux.HandleFunc("GET /api/v1/console/ws", p.handleWS)
+	p.tunnelRoutes(mux)
 	p.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		key := r.Method + " " + r.URL.Path
@@ -167,6 +173,12 @@ func (p *fakePanel) auth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+testToken {
 			fail(w, 401, "token CLI tidak berlaku")
+			return
+		}
+		p.mu.Lock()
+		af := p.authFail
+		p.mu.Unlock()
+		if af != nil && af(w) {
 			return
 		}
 		h(w, r)

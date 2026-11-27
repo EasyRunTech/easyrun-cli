@@ -20,7 +20,20 @@ func execSSH(path string, argv, env []string) (int, error) {
 func ignoreSIGPIPE() { signal.Ignore(syscall.SIGPIPE) }
 
 // SignalContext — dibatalkan oleh Ctrl+C, SIGTERM, atau SIGHUP (ssh
-// mengirim SIGHUP ke ProxyCommand saat selesai).
+// mengirim SIGHUP ke ProxyCommand saat selesai). Fungsi stop-nya
+// mengembalikan perilaku sinyal bawaan.
 func SignalContext() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	return signal.NotifyContext(context.Background(), exitSignals(signal.Ignored)...)
+}
+
+// exitSignals — sinyal yang membatalkan SignalContext. SIGHUP yang sudah
+// diabaikan sejak awal (nohup) tidak didaftarkan: signal.Notify memasang
+// handler yang membatalkan "abaikan" itu, sehingga `nohup easyrun expose … &`
+// ikut berhenti saat terminal ditutup.
+func exitSignals(ignored func(os.Signal) bool) []os.Signal {
+	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !ignored(syscall.SIGHUP) {
+		sigs = append(sigs, syscall.SIGHUP)
+	}
+	return sigs
 }
